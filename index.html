@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kaiho Tracker — Parts Velocity Index</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --line:#2a3140;
+    --txt:#e6edf3; --muted:#8b949e; --dim:#6e7681;
+    --accent:#3fb950;     /* sold / primary signal — green = movement */
+    --restock:#58a6ff;    /* restocked */
+    --new:#d29922;        /* new listing */
+    --price:#a371f7;      /* price change */
+    --epw:#f0883e; --kaiho:#56d4dd;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  a{color:var(--restock);text-decoration:none}
+  header{padding:20px 24px;border-bottom:1px solid var(--line);
+    display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+  header h1{font-size:18px;margin:0;font-weight:650;letter-spacing:-.2px}
+  .badge{font-size:11px;color:var(--muted);background:var(--panel2);
+    padding:3px 8px;border-radius:20px;border:1px solid var(--line)}
+  .disclaimer{font-size:12px;color:var(--dim);max-width:680px;margin-left:auto}
+  .wrap{padding:20px 24px;max-width:1280px;margin:0 auto}
+
+  .kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+    gap:12px;margin-bottom:20px}
+  .kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .kpi .label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+  .kpi .val{font-size:26px;font-weight:680;margin-top:4px;letter-spacing:-.5px}
+  .kpi .sub{font-size:12px;color:var(--dim);margin-top:2px}
+
+  .filters{display:flex;gap:10px;flex-wrap:wrap;align-items:center;
+    margin-bottom:18px;padding:12px 14px;background:var(--panel);
+    border:1px solid var(--line);border-radius:10px}
+  .filters label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-right:4px}
+  select,button{background:var(--panel2);color:var(--txt);border:1px solid var(--line);
+    border-radius:7px;padding:7px 10px;font-size:13px;cursor:pointer}
+  .seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}
+  .seg button{border:0;border-radius:0;background:var(--panel2)}
+  .seg button.on{background:var(--accent);color:#06210d;font-weight:600}
+
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+  .card h3{margin:0 0 12px;font-size:13px;font-weight:600;color:var(--txt)}
+  .card .hint{font-size:11px;color:var(--dim);font-weight:400}
+  .full{grid-column:1/-1}
+  canvas{max-height:280px}
+
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line)}
+  th{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;
+    position:sticky;top:0;background:var(--panel);cursor:pointer;user-select:none}
+  tbody tr:hover{background:var(--panel2)}
+  .tag{font-size:11px;padding:2px 7px;border-radius:5px;font-weight:600}
+  .t-sold{background:rgba(63,185,80,.15);color:var(--accent)}
+  .t-restocked{background:rgba(88,166,255,.15);color:var(--restock)}
+  .t-new{background:rgba(210,153,34,.15);color:var(--new)}
+  .t-price_change{background:rgba(163,113,247,.15);color:var(--price)}
+  .store-pill{font-size:11px;color:var(--muted)}
+  .scrollbox{max-height:520px;overflow:auto;border-radius:8px}
+  .empty{padding:40px;text-align:center;color:var(--dim)}
+  .empty b{color:var(--muted);display:block;margin-bottom:6px;font-size:15px}
+  .num{font-variant-numeric:tabular-nums}
+  @media(max-width:820px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Parts Velocity Index</h1>
+  <span class="badge" id="genBadge">loading…</span>
+  <span class="disclaimer">Directional proxy. Measures stock availability transitions
+    (in-stock&nbsp;→&nbsp;out) as a sale signal — it undercounts items that sell and
+    relist between snapshots and cannot see multi-unit sales. Not exact unit sales.</span>
+</header>
+
+<div class="wrap">
+  <div class="kpis" id="kpis"></div>
+
+  <div class="filters">
+    <span><label>Store</label>
+      <select id="fStore"><option value="">All stores</option>
+        <option value="epartsworld-kenya">epartsworld</option>
+        <option value="kaihoindustry">kaiho</option></select></span>
+    <span><label>Category</label><select id="fCat"><option value="">All categories</option></select></span>
+    <span><label>Event</label><select id="fType"><option value="">All events</option>
+        <option value="sold">Sold</option><option value="restocked">Restocked</option>
+        <option value="new">New listing</option><option value="price_change">Price change</option></select></span>
+    <span style="margin-left:auto"><label>Rollup</label>
+      <span class="seg" id="rollup"><button data-r="day" class="on">Daily</button>
+        <button data-r="week">Weekly</button></span></span>
+  </div>
+
+  <div class="grid">
+    <div class="card full">
+      <h3>Sales-velocity volume over time <span class="hint">— in-stock→out transitions per period</span></h3>
+      <canvas id="cVol"></canvas>
+    </div>
+    <div class="card">
+      <h3>Sell-through by category <span class="hint">— sold events</span></h3>
+      <canvas id="cCat"></canvas>
+    </div>
+    <div class="card">
+      <h3>Sell-through by make <span class="hint">— top 12</span></h3>
+      <canvas id="cMake"></canvas>
+    </div>
+    <div class="card">
+      <h3>New-listing intake rate <span class="hint">— new SKUs per period</span></h3>
+      <canvas id="cIntake"></canvas>
+    </div>
+    <div class="card">
+      <h3>In-stock catalog mix <span class="hint">— current standing composition</span></h3>
+      <canvas id="cStock"></canvas>
+    </div>
+  </div>
+
+  <div class="card full">
+    <h3>Recent events <span class="hint" id="rowCount"></span></h3>
+    <div class="scrollbox">
+      <table id="tbl">
+        <thead><tr>
+          <th data-k="ts">Date</th><th data-k="type">Event</th><th data-k="store">Store</th>
+          <th data-k="make">Make</th><th data-k="category">Category</th>
+          <th data-k="title">Listing</th><th data-k="price" class="num">Price (KES)</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const COLORS={sold:'#3fb950',restocked:'#58a6ff',new:'#d29922',price_change:'#a371f7'};
+const CATCOLORS=['#3fb950','#58a6ff','#d29922','#a371f7','#f0883e','#56d4dd','#db61a2',
+  '#e3b341','#7ee787','#a5d6ff','#ffa657','#d2a8ff','#ff7b72'];
+Chart.defaults.color='#8b949e';
+Chart.defaults.borderColor='#2a3140';
+Chart.defaults.font.family='-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif';
+
+let DATA=null, charts={}, rollup='day', sortK='ts', sortDir=-1;
+
+function isoWeek(d){ // d = 'YYYY-MM-DD' -> 'YYYY-Www'
+  const dt=new Date(d+'T00:00:00Z');
+  const day=(dt.getUTCDay()+6)%7; dt.setUTCDate(dt.getUTCDate()-day+3);
+  const firstThu=new Date(Date.UTC(dt.getUTCFullYear(),0,4));
+  const week=1+Math.round(((dt-firstThu)/86400000-3+((firstThu.getUTCDay()+6)%7))/7);
+  return dt.getUTCFullYear()+'-W'+String(week).padStart(2,'0');
+}
+function periodKey(d){return rollup==='week'?isoWeek(d):d;}
+
+async function load(){
+  try{
+    const r=await fetch('data/dashboard.json?_='+Date.now());
+    if(!r.ok) throw new Error(r.status);
+    DATA=await r.json();
+  }catch(e){
+    document.getElementById('genBadge').textContent='no data yet';
+    return;
+  }
+  document.getElementById('genBadge').textContent=
+    'updated '+new Date(DATA.generated).toLocaleString('en-GB',{dateStyle:'medium',timeStyle:'short'});
+  buildCatFilter();
+  renderKPIs();
+  renderAll();
+}
+
+function buildCatFilter(){
+  const sel=document.getElementById('fCat');
+  Object.keys(DATA.stock_composition.category).forEach(c=>{
+    const o=document.createElement('option');o.value=c;o.textContent=c;sel.appendChild(o);
+  });
+}
+
+function renderKPIs(){
+  const t=DATA.totals, s=DATA.sold_totals;
+  const totalSold=Object.values(s.by_category).reduce((a,b)=>a+b,0);
+  const days=Object.keys(DATA.events_by_day).length;
+  const intake=Object.values(DATA.events_by_day).reduce((a,d)=>a+(d.new||0),0);
+  const kpis=[
+    {label:'Catalog tracked',val:t.catalog.toLocaleString(),sub:`${t.by_store['epartsworld-kenya'].toLocaleString()} epw · ${t.by_store['kaihoindustry'].toLocaleString()} kaiho`},
+    {label:'In stock now',val:t.in_stock.toLocaleString(),sub:`${(100*t.in_stock/t.catalog).toFixed(0)}% of catalog`},
+    {label:'Sold (proxy)',val:totalSold.toLocaleString(),sub:days?`across ${days} day${days>1?'s':''}`:'awaiting first diff'},
+    {label:'New listings',val:intake.toLocaleString(),sub:'intake observed'},
+  ];
+  document.getElementById('kpis').innerHTML=kpis.map(k=>
+    `<div class="kpi"><div class="label">${k.label}</div><div class="val num">${k.val}</div><div class="sub">${k.sub}</div></div>`).join('');
+}
+
+function filtered(){
+  const fs=document.getElementById('fStore').value;
+  const fc=document.getElementById('fCat').value;
+  const ft=document.getElementById('fType').value;
+  return (DATA.recent_events||[]).filter(e=>
+    (!fs||e.store===fs)&&(!fc||e.category===fc)&&(!ft||e.type===ft));
+}
+
+// Aggregate filtered events into period -> type counts (respects store/cat filters).
+function aggByPeriod(evts){
+  const m={};
+  evts.forEach(e=>{const k=periodKey(e.ts);(m[k]=m[k]||{sold:0,restocked:0,new:0,price_change:0})[e.type]++;});
+  return m;
+}
+
+function makeChart(id,cfg){ if(charts[id])charts[id].destroy(); charts[id]=new Chart(document.getElementById(id),cfg); }
+
+function renderAll(){
+  const evts=filtered();
+  const agg=aggByPeriod(evts);
+  const periods=Object.keys(agg).sort();
+
+  // Volume (sold) over time.
+  makeChart('cVol',{type:'bar',data:{labels:periods,
+    datasets:[{label:'Sold (proxy)',data:periods.map(p=>agg[p].sold),backgroundColor:COLORS.sold,borderRadius:3},
+      {label:'Restocked',data:periods.map(p=>agg[p].restocked),backgroundColor:COLORS.restocked,borderRadius:3}]},
+    options:{responsive:true,scales:{x:{stacked:false,grid:{display:false}},y:{beginAtZero:true}},
+      plugins:{legend:{position:'bottom'}}}});
+
+  // Intake.
+  makeChart('cIntake',{type:'line',data:{labels:periods,
+    datasets:[{label:'New listings',data:periods.map(p=>agg[p].new),borderColor:COLORS.new,
+      backgroundColor:'rgba(210,153,34,.12)',fill:true,tension:.25,pointRadius:2}]},
+    options:{responsive:true,scales:{x:{grid:{display:false}},y:{beginAtZero:true}},plugins:{legend:{display:false}}}});
+
+  // Sold by category (from filtered sold events).
+  const catC={}; evts.filter(e=>e.type==='sold').forEach(e=>{const c=e.category||'Other / Misc';catC[c]=(catC[c]||0)+1;});
+  const catEntries=Object.entries(catC).sort((a,b)=>b[1]-a[1]);
+  makeChart('cCat',{type:'bar',data:{labels:catEntries.map(e=>e[0]),
+    datasets:[{data:catEntries.map(e=>e[1]),backgroundColor:CATCOLORS,borderRadius:3}]},
+    options:{indexAxis:'y',responsive:true,plugins:{legend:{display:false}},scales:{x:{beginAtZero:true}}}});
+
+  // Sold by make.
+  const makeC={}; evts.filter(e=>e.type==='sold').forEach(e=>{const m=e.make||'Unknown';makeC[m]=(makeC[m]||0)+1;});
+  const makeEntries=Object.entries(makeC).sort((a,b)=>b[1]-a[1]).slice(0,12);
+  makeChart('cMake',{type:'bar',data:{labels:makeEntries.map(e=>e[0]),
+    datasets:[{data:makeEntries.map(e=>e[1]),backgroundColor:CATCOLORS,borderRadius:3}]},
+    options:{indexAxis:'y',responsive:true,plugins:{legend:{display:false}},scales:{x:{beginAtZero:true}}}});
+
+  // In-stock composition (standing state, not filtered by event type).
+  const sc=DATA.stock_composition.category;
+  const scE=Object.entries(sc).sort((a,b)=>b[1]-a[1]);
+  makeChart('cStock',{type:'doughnut',data:{labels:scE.map(e=>e[0]),
+    datasets:[{data:scE.map(e=>e[1]),backgroundColor:CATCOLORS,borderWidth:1,borderColor:'#161b22'}]},
+    options:{responsive:true,plugins:{legend:{position:'right',labels:{boxWidth:10,font:{size:11}}}}}});
+
+  renderTable(evts);
+}
+
+function renderTable(evts){
+  const tb=document.getElementById('tbody');
+  const sorted=[...evts].sort((a,b)=>{
+    let x=a[sortK],y=b[sortK];
+    if(sortK==='price'){x=x??-1;y=y??-1;return (x-y)*sortDir;}
+    x=(x||'').toString();y=(y||'').toString();return x<y?-sortDir:x>y?sortDir:0;
+  });
+  document.getElementById('rowCount').textContent=`— ${sorted.length} shown (latest 500 logged)`;
+  if(!sorted.length){tb.innerHTML=`<tr><td colspan="7"><div class="empty"><b>No events yet</b>The first sale, restock, price change or new listing will appear after the next scrape diffs against the baseline.</div></td></tr>`;return;}
+  tb.innerHTML=sorted.map(e=>{
+    const price=e.type==='price_change'&&e.old_price!=null
+      ?`<span style="color:var(--dim);text-decoration:line-through">${fmt(e.old_price)}</span> ${fmt(e.new_price)}`
+      :(e.price!=null?fmt(e.price):'—');
+    return `<tr>
+      <td class="num">${e.ts}</td>
+      <td><span class="tag t-${e.type}">${e.type.replace('_',' ')}</span></td>
+      <td class="store-pill">${e.store==='epartsworld-kenya'?'epw':'kaiho'}</td>
+      <td>${e.make||'—'}</td><td>${e.category||'—'}</td>
+      <td><a href="${e.url}" target="_blank" rel="noopener">${(e.title||'').slice(0,70)}</a></td>
+      <td class="num">${price}</td></tr>`;
+  }).join('');
+}
+function fmt(n){return n==null?'—':Number(n).toLocaleString('en-KE');}
+
+// Wiring.
+['fStore','fCat','fType'].forEach(id=>document.getElementById(id).addEventListener('change',renderAll));
+document.getElementById('rollup').addEventListener('click',e=>{
+  if(e.target.tagName!=='BUTTON')return;
+  rollup=e.target.dataset.r;
+  [...e.currentTarget.children].forEach(b=>b.classList.toggle('on',b===e.target));
+  renderAll();
+});
+document.querySelectorAll('#tbl th').forEach(th=>th.addEventListener('click',()=>{
+  const k=th.dataset.k; if(sortK===k)sortDir*=-1;else{sortK=k;sortDir=k==='ts'?-1:1;}
+  renderTable(filtered());
+}));
+
+load();
+</script>
+</body>
+</html>
