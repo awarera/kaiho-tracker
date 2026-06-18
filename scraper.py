@@ -43,20 +43,25 @@ EVENTS_FILE = DATA / "events.json"
 SEEN_FILE = DATA / "seen_ids.json"
 LATEST_FILE = DATA / "latest.json"
 
-REQUEST_DELAY = 0.05          # tiny politeness delay per request (s)
-MAX_RETRIES = 6               # per-request retry budget
-BACKOFF_BASE = 2.0            # exponential backoff base
-BACKOFF_CAP = 30.0            # max sleep between retries (s)
+REQUEST_DELAY = 0.0           # no artificial delay; the pool paces itself
+MAX_RETRIES = 3               # per-request retry budget (was 6 — too many on
+                              # a throttled store, each retry burns the timeout)
+BACKOFF_BASE = 1.6            # gentler exponential backoff
+BACKOFF_CAP = 6.0            # max sleep between retries (was 30 — a single
+                              # throttled request could otherwise stall ~minutes)
+REQUEST_TIMEOUT = 12          # per-request hard timeout (was 30 — throttled
+                              # requests hung to the wall and doubled on retry)
 PER_PAGE = 250                # Shopify hard max
-WORKERS = 8                   # concurrent collection fetches per store
-                              # (8 keeps us under Shopify rate limits while
-                              #  cutting a 90+ min serial run to a few minutes)
-SAFETY_MINUTES = 45           # wall-clock budget. The parallel pull finishes in
-                              # ~5 min; if it ever runs this long the stores are
-                              # pathologically slow, so we abort WITHOUT committing
-                              # rather than risk a partial snapshot being misread
-                              # as mass "sold" events. Sits under the 60-min job
-                              # timeout so the exit is always clean.
+WORKERS = 5                   # concurrent collection fetches per store.
+                              # 8 was too aggressive — it triggered MORE store
+                              # throttling (60s+ stalls). 5 is the balance:
+                              # enough concurrency to be fast, gentle enough to
+                              # avoid rate-limit walls.
+SAFETY_MINUTES = 45           # wall-clock budget. If the run ever takes this
+                              # long the store is pathologically throttled, so we
+                              # abort WITHOUT committing rather than risk a partial
+                              # snapshot being misread as mass "sold" events.
+                              # Sits under the 60-min job timeout for a clean exit.
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; catalog-monitor/1.0)",
     "Accept": "application/json",
@@ -222,7 +227,7 @@ def get_json(url: str) -> dict | None:
     """GET with exponential backoff on 429/503. Returns parsed JSON or None."""
     for attempt in range(MAX_RETRIES):
         try:
-            r = SESSION.get(url, timeout=30)
+            r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
             if r.status_code == 200:
                 if REQUEST_DELAY:
                     time.sleep(REQUEST_DELAY)
