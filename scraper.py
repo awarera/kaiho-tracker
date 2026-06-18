@@ -469,58 +469,118 @@ def main():
     print("=== done ===")
 
 
+CATALOG_FIELDS = ("id", "store", "title", "make", "model", "category",
+                  "part_label", "price", "available", "url", "created_at", "vendor")
+
+
 def build_dashboard_payload(curr: dict, events: list, store_counts: dict):
-    """Write data/dashboard.json: compact rollups for the static dashboard."""
-    from collections import Counter, defaultdict
+    """Write two files:
+      - data/dashboard.json : compact aggregates (loads instantly; every tab's
+        summary numbers + the full recent-event log).
+      - data/catalog.json   : trimmed full catalog (one row per listing, no
+        images) for the Catalog / Categories / Raw-data tables.
+    All aggregates are kept per-store so the dashboard's store toggle
+    (Epartsworld / Kaiho / All) can slice without re-fetching.
+    """
+    from collections import defaultdict
 
-    # Current standing-state rollups (in-stock catalog composition).
-    in_stock = [p for p in curr.values() if p.get("available")]
-    cat_stock = Counter(p["category"] for p in in_stock)
-    make_stock = Counter((p.get("make") or "Unknown") for p in in_stock)
-    store_stock = Counter(p["store"] for p in in_stock)
+    STORES_K = list(store_counts.keys())
 
-    # Event rollups by day.
-    by_day = defaultdict(lambda: defaultdict(int))      # day -> type -> count
-    sold_by_cat = defaultdict(lambda: defaultdict(int)) # day -> cat -> sold
-    sold_by_make = Counter()
-    sold_by_store = Counter()
-    sold_by_cat_total = Counter()
+    def store_buckets():
+        return {s: 0 for s in STORES_K}
+
+    # ---- Standing-state catalog composition, per store ----
+    cat_comp = defaultdict(lambda: {s: {"listings": 0, "in_stock": 0,
+                                        "value": 0.0} for s in STORES_K})
+    make_in_stock = defaultdict(store_buckets)
+    in_stock_count = store_buckets()
+    in_stock_value = {s: 0.0 for s in STORES_K}
+    catalog_value = {s: 0.0 for s in STORES_K}
+
+    for p in curr.values():
+        s = p["store"]
+        cat = p.get("category") or "Other / Misc"
+        price = p.get("price") or 0
+        cat_comp[cat][s]["listings"] += 1
+        catalog_value[s] += price
+        if p.get("available"):
+            cat_comp[cat][s]["in_stock"] += 1
+            cat_comp[cat][s]["value"] += price
+            in_stock_count[s] += 1
+            in_stock_value[s] += price
+            make_in_stock[(p.get("make") or "Unknown")][s] += 1
+
+    # ---- Event aggregates by day, per store, with KES value ----
+    def day_store():
+        return {s: defaultdict(lambda: {"count": 0, "value": 0.0})
+                for s in STORES_K}
+    by_day = defaultdict(day_store)
+    sold_make = defaultdict(store_buckets)
+    sold_cat = defaultdict(store_buckets)
+    sold_cat_value = defaultdict(lambda: {s: 0.0 for s in STORES_K})
+
     for e in events:
         d = e["ts"]
-        by_day[d][e["type"]] += 1
-        if e["type"] == "sold":
-            sold_by_cat[d][e.get("category") or "Other / Misc"] += 1
-            sold_by_make[e.get("make") or "Unknown"] += 1
-            sold_by_store[e.get("store")] += 1
-            sold_by_cat_total[e.get("category") or "Other / Misc"] += 1
+        s = e.get("store")
+        if s not in store_counts:
+            continue
+        t = e["type"]
+        price = e.get("price") or 0
+        rec = by_day[d][s][t]
+        rec["count"] += 1
+        rec["value"] += price
+        if t == "sold":
+            sold_make[e.get("make") or "Unknown"][s] += 1
+            cat = e.get("category") or "Other / Misc"
+            sold_cat[cat][s] += 1
+            sold_cat_value[cat][s] += price
 
-    # Recent events feed (last 500, newest first).
-    recent = sorted(events, key=lambda e: e["ts"], reverse=True)[:500]
+    events_by_day = {}
+    for d, stores in sorted(by_day.items()):
+        events_by_day[d] = {
+            s: {t: dict(v) for t, v in types.items()}
+            for s, types in stores.items()
+        }
+
+    recent = sorted(events, key=lambda e: e["ts"], reverse=True)[:1000]
+
+    make_totals = sorted(make_in_stock.items(),
+                         key=lambda kv: -sum(kv[1].values()))[:30]
 
     payload = {
         "generated": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "stores": STORES_K,
         "totals": {
-            "catalog": sum(store_counts.values()),
-            "in_stock": len(in_stock),
-            "by_store": store_counts,
-            "in_stock_by_store": dict(store_stock),
+            "catalog": store_counts,
+            "in_stock": in_stock_count,
+            "in_stock_value": {s: round(v) for s, v in in_stock_value.items()},
+            "catalog_value": {s: round(v) for s, v in catalog_value.items()},
         },
-        "stock_composition": {
-            "category": dict(cat_stock.most_common()),
-            "make": dict(make_stock.most_common(20)),
+        "category_composition": {
+            cat: {s: {"listings": d[s]["listings"],
+                      "in_stock": d[s]["in_stock"],
+                      "value": round(d[s]["value"])} for s in STORES_K}
+            for cat, d in cat_comp.items()
         },
-        "events_by_day": {d: dict(v) for d, v in sorted(by_day.items())},
-        "sold_by_day_category": {d: dict(v) for d, v in sorted(sold_by_cat.items())},
-        "sold_totals": {
-            "by_make": dict(sold_by_make.most_common(20)),
-            "by_store": dict(sold_by_store),
-            "by_category": dict(sold_by_cat_total.most_common()),
-        },
+        "make_in_stock": {m: dict(v) for m, v in make_totals},
+        "events_by_day": events_by_day,
+        "sold_by_make": {m: dict(v) for m, v in sorted(
+            sold_make.items(), key=lambda kv: -sum(kv[1].values()))[:30]},
+        "sold_by_category": {c: dict(v) for c, v in sold_cat.items()},
+        "sold_value_by_category": {c: {s: round(val) for s, val in v.items()}
+                                    for c, v in sold_cat_value.items()},
         "recent_events": recent,
     }
     save_json(DATA / "dashboard.json", payload)
+
+    catalog = [{k: p.get(k) for k in CATALOG_FIELDS} for p in curr.values()]
+    save_json(DATA / "catalog.json.gz", catalog, gz=True)
+
+    import os
+    size = os.path.getsize(DATA / "catalog.json.gz") / 1e6
     print(f"Dashboard payload: {len(recent)} recent events, "
-          f"{len(by_day)} active days.")
+          f"{len(events_by_day)} active days. Catalog: {len(catalog)} rows, "
+          f"{size:.1f}MB gzipped.")
 
 
 if __name__ == "__main__":
