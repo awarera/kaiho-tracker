@@ -22,8 +22,10 @@ import time
 import gzip
 import datetime as dt
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+from requests.adapters import HTTPAdapter
 
 # ----------------------------------------------------------------------------
 # Config
@@ -41,11 +43,20 @@ EVENTS_FILE = DATA / "events.json"
 SEEN_FILE = DATA / "seen_ids.json"
 LATEST_FILE = DATA / "latest.json"
 
-REQUEST_DELAY = 0.25          # polite inter-request delay (s)
+REQUEST_DELAY = 0.05          # tiny politeness delay per request (s)
 MAX_RETRIES = 6               # per-request retry budget
 BACKOFF_BASE = 2.0            # exponential backoff base
 BACKOFF_CAP = 30.0            # max sleep between retries (s)
 PER_PAGE = 250                # Shopify hard max
+WORKERS = 8                   # concurrent collection fetches per store
+                              # (8 keeps us under Shopify rate limits while
+                              #  cutting a 90+ min serial run to a few minutes)
+SAFETY_MINUTES = 45           # wall-clock budget. The parallel pull finishes in
+                              # ~5 min; if it ever runs this long the stores are
+                              # pathologically slow, so we abort WITHOUT committing
+                              # rather than risk a partial snapshot being misread
+                              # as mass "sold" events. Sits under the 60-min job
+                              # timeout so the exit is always clean.
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; catalog-monitor/1.0)",
     "Accept": "application/json",
@@ -198,13 +209,23 @@ def parse_title(title: str) -> dict:
 # HTTP with retry/backoff
 # ----------------------------------------------------------------------------
 
+# Shared session with a connection pool sized for our worker count, so
+# parallel requests reuse TCP connections instead of reopening each time.
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+_adapter = HTTPAdapter(pool_connections=WORKERS * 2, pool_maxsize=WORKERS * 2)
+SESSION.mount("https://", _adapter)
+SESSION.mount("http://", _adapter)
+
+
 def get_json(url: str) -> dict | None:
     """GET with exponential backoff on 429/503. Returns parsed JSON or None."""
     for attempt in range(MAX_RETRIES):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=30)
+            r = SESSION.get(url, timeout=30)
             if r.status_code == 200:
-                time.sleep(REQUEST_DELAY)
+                if REQUEST_DELAY:
+                    time.sleep(REQUEST_DELAY)
                 return r.json()
             if r.status_code in (429, 503, 502, 500):
                 sleep = min(BACKOFF_CAP, BACKOFF_BASE ** attempt)
@@ -276,30 +297,69 @@ def normalize_product(store: str, p: dict) -> dict | None:
     }
 
 
-def pull_store(store: str) -> dict[str, dict]:
-    """Return {product_id: normalized_product} for the full catalog."""
+def fetch_collection(store: str, handle: str) -> dict[str, dict]:
+    """Fetch every product in one collection (paginated). Returns {id: product}."""
+    out: dict[str, dict] = {}
+    page = 1
+    while True:
+        url = (f"https://{store}.myshopify.com/collections/{handle}/products.json"
+               f"?limit={PER_PAGE}&page={page}")
+        data = get_json(url)
+        if not data or not data.get("products"):
+            break
+        for p in data["products"]:
+            norm = normalize_product(store, p)
+            if norm:
+                out[norm["id"]] = norm
+        page += 1
+        if page > 100:  # per-collection safety (collections are small)
+            break
+    return out
+
+
+def pull_store(store: str, deadline: float | None = None) -> tuple[dict[str, dict], bool]:
+    """Return ({product_id: normalized_product}, complete).
+
+    Collections are fetched concurrently (WORKERS threads). This is the hot
+    path: a serial pull of ~770 collections across both stores runs >90 min
+    and gets killed by GitHub's job ceiling; the parallel pull finishes in a
+    few minutes. Dedupe by product id across overlapping collections.
+
+    `deadline` is a time.monotonic() value; if it passes mid-pull we stop
+    collecting and return complete=False so the caller can abort without
+    committing a partial snapshot.
+    """
     products: dict[str, dict] = {}
     handles = list_collections(store)
-    print(f"  [{store}] {len(handles)} collections")
-    for i, h in enumerate(handles, 1):
-        page = 1
-        while True:
-            url = (f"https://{store}.myshopify.com/collections/{h}/products.json"
-                   f"?limit={PER_PAGE}&page={page}")
-            data = get_json(url)
-            if not data or not data.get("products"):
+    print(f"  [{store}] {len(handles)} collections; fetching with {WORKERS} workers")
+    done = 0
+    failed = 0
+    complete = True
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futures = {ex.submit(fetch_collection, store, h): h for h in handles}
+        for fut in as_completed(futures):
+            if deadline is not None and time.monotonic() > deadline:
+                print(f"  [{store}] SAFETY: time budget exceeded mid-pull; "
+                      f"cancelling remaining collections.")
+                for f in futures:
+                    f.cancel()
+                complete = False
                 break
-            for p in data["products"]:
-                norm = normalize_product(store, p)
-                if norm:
-                    products[norm["id"]] = norm  # dedupe by id
-            page += 1
-            if page > 100:  # per-collection safety (collections are small)
-                break
-        if i % 50 == 0:
-            print(f"  [{store}] {i}/{len(handles)} collections, {len(products)} products")
-    print(f"  [{store}] DONE: {len(products)} unique products")
-    return products
+            try:
+                for pid, p in fut.result().items():
+                    products[pid] = p
+            except Exception as e:  # one bad collection must not kill the run
+                failed += 1
+                print(f"  [{store}] collection {futures[fut]!r} failed: {e}")
+            done += 1
+            if done % 50 == 0:
+                print(f"  [{store}] {done}/{len(handles)} collections, "
+                      f"{len(products)} products")
+    if failed:
+        print(f"  [{store}] WARNING: {failed} collection(s) errored (continued).")
+    print(f"  [{store}] DONE: {len(products)} unique products"
+          f"{'' if complete else ' (INCOMPLETE — time budget hit)'}")
+    return products, complete
 
 
 # ----------------------------------------------------------------------------
@@ -399,11 +459,21 @@ def main():
     ts_full = dt.datetime.now(dt.timezone.utc).isoformat()
     print(f"=== Catalog scrape {ts_full} ===")
 
+    run_start = time.monotonic()
+    deadline = run_start + SAFETY_MINUTES * 60
+
     # 1. Pull current full catalog for both stores.
     curr: dict[str, dict] = {}
     per_store_counts = {}
     for store in STORES:
-        prod = pull_store(store)
+        prod, complete = pull_store(store, deadline=deadline)
+        # Abort WITHOUT committing if the pull was cut short — a partial
+        # snapshot would make every un-fetched product look "sold" tomorrow.
+        if not complete:
+            print(f"FATAL: {store} pull incomplete (hit {SAFETY_MINUTES}m safety "
+                  f"budget). Aborting with no commit so we never write a partial "
+                  f"snapshot. Re-run the workflow; the stores were unusually slow.")
+            sys.exit(1)
         per_store_counts[store] = len(prod)
         curr.update(prod)
 
