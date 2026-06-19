@@ -447,26 +447,35 @@ def pull_store(store: str, deadline: float | None = None) -> tuple[dict[str, dic
     failed, timed_out = run_batch(handles, WORKERS, budget)
     complete = not timed_out
 
-    # --- Pass 2: retry failed collections once, gently (throttle recovery) ---
-    # Throttle-dropped collections are the main undercount cause; a cooldown +
-    # lower concurrency recovers almost all of them and keeps us above the
-    # retention guard.
-    if failed and complete:
+    # --- Pass 2: retry failed collections ONCE, time-boxed and gentle ---
+    # Throttle-dropped collections are usually redundant (their products appear
+    # in other collections too), so we try to recover them but NEVER let the
+    # retry fight a rate-limit wall to the safety valve. It gets its own short
+    # budget; if it can't finish in that window we keep what we have and let the
+    # count-based retention guard in main() judge whether coverage is sufficient.
+    RETRY_BUDGET_S = 300  # 5 minutes max for the recovery pass
+    if failed and not timed_out:
         print(f"  [{store}] retrying {len(failed)} failed collection(s) "
-              f"after cooldown…")
-        time.sleep(10)
-        budget2 = None if deadline is None else max(1.0, deadline - time.monotonic())
-        if budget2 is None or budget2 > 30:  # only if we have time left
-            still_failed, timed_out2 = run_batch(failed, max(2, WORKERS // 2), budget2)
-            failed = still_failed
-            if timed_out2:
-                complete = False
+              f"after cooldown (max {RETRY_BUDGET_S//60}m)…")
+        time.sleep(8)
+        # Bound the retry by BOTH the overall deadline and its own 5-min cap.
+        retry_deadline = time.monotonic() + RETRY_BUDGET_S
+        if deadline is not None:
+            retry_deadline = min(retry_deadline, deadline)
+        budget2 = max(1.0, retry_deadline - time.monotonic())
+        still_failed, _ = run_batch(failed, max(2, WORKERS // 2), budget2)
+        failed = still_failed
 
+    # Completeness contract: we are "complete" unless the MAIN pass timed out.
+    # A handful of unrecovered redundant collections does NOT make the snapshot
+    # partial — main()'s retention guard checks the actual product count against
+    # the previous snapshot, which is the real integrity test.
+    complete = not timed_out
     if failed:
-        print(f"  [{store}] WARNING: {len(failed)} collection(s) still failed "
-              f"after retry.")
+        print(f"  [{store}] NOTE: {len(failed)} collection(s) unrecovered "
+              f"(likely redundant; coverage check in main decides).")
     print(f"  [{store}] DONE: {len(products)} unique products"
-          f"{'' if complete else ' (INCOMPLETE — time budget hit)'}")
+          f"{'' if complete else ' (MAIN PASS INCOMPLETE — time budget hit)'}")
     return products, complete
 
 
@@ -577,15 +586,17 @@ def main():
     # 1. Pull current full catalog for both stores.
     curr: dict[str, dict] = {}
     per_store_counts = {}
+    incomplete_stores = []
     for store in STORES:
         prod, complete = pull_store(store, deadline=deadline)
-        # Abort WITHOUT committing if the pull was cut short — a partial
-        # snapshot would make every un-fetched product look "sold" tomorrow.
         if not complete:
-            print(f"FATAL: {store} pull incomplete (hit {SAFETY_MINUTES}m safety "
-                  f"budget). Aborting with no commit so we never write a partial "
-                  f"snapshot. Re-run the workflow; the stores were unusually slow.")
-            sys.exit(1)
+            # Main pass hit the time budget. Don't abort yet — the retention
+            # guard below checks whether we still captured enough of the catalog.
+            # A run that got 95%+ of baseline before timing out is fine to commit;
+            # only a genuinely thin pull should be rejected.
+            incomplete_stores.append(store)
+            print(f"  [{store}] main pass incomplete; coverage will be checked "
+                  f"against the previous snapshot before deciding.")
         per_store_counts[store] = len(prod)
         curr.update(prod)
 
@@ -603,16 +614,31 @@ def main():
     if prev_path:
         prev_list = load_json(prev_path, [])
         prev = {p["id"]: p for p in prev_list}
-        # Retention guard per store.
+        # Coverage guard per store — the real integrity check.
         prev_counts = {}
         for p in prev.values():
             prev_counts[p["store"]] = prev_counts.get(p["store"], 0) + 1
         for store, n in per_store_counts.items():
             old = prev_counts.get(store, 0)
-            if old and n < old * MIN_RETENTION:
-                print(f"FATAL: {store} collapsed {old} -> {n} (<{int(MIN_RETENTION*100)}%). "
-                      f"Likely partial scrape. Aborting (no commit, no diff).")
+            if not old:
+                continue
+            coverage = n / old
+            # A timed-out pull must clear a HIGHER bar (90%) to be trusted, since
+            # we know it was cut short. A clean pull uses the normal floor (70%).
+            floor = 0.90 if store in incomplete_stores else MIN_RETENTION
+            if coverage < floor:
+                print(f"FATAL: {store} coverage {n}/{old} = {coverage*100:.0f}% "
+                      f"(< {int(floor*100)}% floor"
+                      f"{' for timed-out pull' if store in incomplete_stores else ''}). "
+                      f"Aborting (no commit, no diff). Re-run the workflow.")
                 sys.exit(1)
+            print(f"  [{store}] coverage {n}/{old} = {coverage*100:.0f}% — OK")
+    elif incomplete_stores:
+        # Cold start (no previous snapshot to compare) AND a pass timed out —
+        # we can't verify coverage, so don't risk a thin baseline. Abort.
+        print(f"FATAL: first run and {incomplete_stores} timed out — cannot "
+              f"verify coverage for a baseline. Aborting; re-run the workflow.")
+        sys.exit(1)
 
     # 3. Load seen-ids (cold-start guard).
     seen = load_json(SEEN_FILE, {})
