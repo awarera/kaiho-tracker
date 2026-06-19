@@ -6,7 +6,6 @@
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Kaiho Tracker — Peach Cars Intelligence</title>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/fflate/0.8.2/umd/index.js"></script>
 <style>
 :root{
   color-scheme:light;
@@ -373,17 +372,9 @@ function ensureCatalog(cb){
   if(CATALOG){cb();return;}
   if(CATALOG_LOADING)return;
   CATALOG_LOADING=true;
-  fetch('data/catalog.json.gz?_='+Date.now())
-    .then(function(r){if(!r.ok)throw new Error(r.status);return r.arrayBuffer();})
-    .then(function(buf){
-      var bytes=new Uint8Array(buf);
-      var json;
-      try{
-        var out=fflate.gunzipSync(bytes);
-        json=JSON.parse(new TextDecoder().decode(out));
-      }catch(err){
-        json=JSON.parse(new TextDecoder().decode(bytes));
-      }
+  fetch('data/catalog.json?_='+Date.now())
+    .then(function(r){if(!r.ok)throw new Error(r.status);return r.json();})
+    .then(function(json){
       CATALOG=json;
       CATALOG_LOADING=false;
       cb();

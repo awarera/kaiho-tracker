@@ -696,7 +696,7 @@ def main():
 
 
 CATALOG_FIELDS = ("id", "store", "title", "make", "model", "category",
-                  "part_label", "price", "available", "url", "created_at", "vendor")
+                  "part_label", "price", "available", "url")
 
 
 def build_dashboard_payload(curr: dict, events: list, store_counts: dict):
@@ -800,13 +800,18 @@ def build_dashboard_payload(curr: dict, events: list, store_counts: dict):
     save_json(DATA / "dashboard.json", payload)
 
     catalog = [{k: p.get(k) for k in CATALOG_FIELDS} for p in curr.values()]
-    save_json(DATA / "catalog.json.gz", catalog, gz=True)
+    # Plain JSON, NOT gzipped: GitHub Pages auto-gzips JSON over the wire anyway,
+    # and serving a literal .gz tripped the browser's transparent decompression
+    # (it would double-decode or mislabel encoding), leaving the Catalog/Raw-Data
+    # tabs empty. Plain .json is handled natively by fetch().json() — no fflate,
+    # no CDN dependency, no decode ambiguity.
+    save_json(DATA / "catalog.json", catalog, gz=False)
 
     import os
-    size = os.path.getsize(DATA / "catalog.json.gz") / 1e6
+    size = os.path.getsize(DATA / "catalog.json") / 1e6
     print(f"Dashboard payload: {len(recent)} recent events, "
           f"{len(events_by_day)} active days. Catalog: {len(catalog)} rows, "
-          f"{size:.1f}MB gzipped.")
+          f"{size:.1f}MB (plain json).")
 
 
 if __name__ == "__main__":
