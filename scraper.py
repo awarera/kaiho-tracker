@@ -233,8 +233,17 @@ SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
 
 
-def get_json(url: str) -> dict | None:
-    """GET with exponential backoff on 429/503. Returns parsed JSON or None."""
+class FetchError(Exception):
+    """Raised when a request fails after exhausting retries (throttle/network).
+    Distinct from a 404, which legitimately means 'nothing here'. This lets the
+    caller avoid mistaking a throttled response for an empty collection — the
+    bug that caused ~34% undercounts and tripped the retention guard."""
+
+
+def get_json(url: str):
+    """GET with exponential backoff. Returns parsed JSON, or None for a real
+    404 (definitively empty). Raises FetchError if all retries are exhausted."""
+    last_status = None
     for attempt in range(MAX_RETRIES):
         try:
             r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
@@ -242,17 +251,17 @@ def get_json(url: str) -> dict | None:
                 if REQUEST_DELAY:
                     time.sleep(REQUEST_DELAY)
                 return r.json()
-            if r.status_code in (429, 503, 502, 500):
-                sleep = min(BACKOFF_CAP, BACKOFF_BASE ** attempt)
-                time.sleep(sleep)
-                continue
             if r.status_code == 404:
-                return None
-            # Other codes: brief pause then retry.
+                return None  # genuinely nothing here
+            last_status = r.status_code
+            # 429/503/502/500 and anything else: back off and retry.
             time.sleep(min(BACKOFF_CAP, BACKOFF_BASE ** attempt))
-        except requests.RequestException:
+        except requests.RequestException as e:
+            last_status = repr(e)
             time.sleep(min(BACKOFF_CAP, BACKOFF_BASE ** attempt))
-    return None
+    # Exhausted retries — signal a real failure, do NOT return None (which the
+    # caller would read as "empty collection").
+    raise FetchError(f"{url} failed after {MAX_RETRIES} retries (last={last_status})")
 
 
 # ----------------------------------------------------------------------------
@@ -260,11 +269,23 @@ def get_json(url: str) -> dict | None:
 # ----------------------------------------------------------------------------
 
 def list_collections(store: str) -> list[str]:
+    """Enumerate all collection handles. Each page is retried hard; if a page
+    truly can't be fetched we raise rather than silently returning a short list
+    (a short list would drop whole collections and undercount the catalog)."""
     handles = []
     page = 1
     while True:
         url = f"https://{store}.myshopify.com/collections.json?limit={PER_PAGE}&page={page}"
-        data = get_json(url)
+        # Retry this page a few times on FetchError before giving up the run.
+        data = None
+        for tries in range(3):
+            try:
+                data = get_json(url)
+                break
+            except FetchError as e:
+                if tries == 2:
+                    raise FetchError(f"list_collections[{store}] page {page}: {e}")
+                time.sleep(3 * (tries + 1))
         if not data or not data.get("collections"):
             break
         for c in data["collections"]:
@@ -313,14 +334,20 @@ def normalize_product(store: str, p: dict) -> dict | None:
 
 
 def fetch_collection(store: str, handle: str) -> dict[str, dict]:
-    """Fetch every product in one collection (paginated). Returns {id: product}."""
+    """Fetch every product in one collection (paginated). Returns {id: product}.
+
+    Raises FetchError if a page fails after retries — the caller treats that as
+    a failed collection (to retry later), NOT as an empty one. Silently treating
+    a throttled response as empty was the cause of catalog undercounts."""
     out: dict[str, dict] = {}
     page = 1
     while True:
         url = (f"https://{store}.myshopify.com/collections/{handle}/products.json"
                f"?limit={PER_PAGE}&page={page}")
-        data = get_json(url)
-        if not data or not data.get("products"):
+        data = get_json(url)            # may raise FetchError → propagates up
+        if data is None:               # genuine 404 — collection gone/empty
+            break
+        if not data.get("products"):   # legitimately no (more) products
             break
         for p in data["products"]:
             norm = normalize_product(store, p)
@@ -347,38 +374,61 @@ def pull_store(store: str, deadline: float | None = None) -> tuple[dict[str, dic
     products: dict[str, dict] = {}
     handles = list_collections(store)
     print(f"  [{store}] {len(handles)} collections; fetching with {WORKERS} workers")
-    done = 0
-    failed = 0
-    complete = True
-    ex = ThreadPoolExecutor(max_workers=WORKERS)
-    futures = {ex.submit(fetch_collection, store, h): h for h in handles}
-    try:
-        # Enforce the wall-clock budget at the executor level: as_completed
-        # raises TimeoutError the moment the remaining budget elapses, even if
-        # several workers are mid-request. This makes a long hang impossible.
-        budget = None
-        if deadline is not None:
-            budget = max(1.0, deadline - time.monotonic())
-        for fut in as_completed(futures, timeout=budget):
-            try:
-                for pid, p in fut.result().items():
-                    products[pid] = p
-            except Exception as e:  # one bad collection must not kill the run
-                failed += 1
-                print(f"  [{store}] collection {futures[fut]!r} failed: {e}")
-            done += 1
-            if done % 50 == 0:
-                print(f"  [{store}] {done}/{len(handles)} collections, "
-                      f"{len(products)} products")
-    except TimeoutError:
-        complete = False
-        print(f"  [{store}] SAFETY: {SAFETY_MINUTES}m budget hit with "
-              f"{done}/{len(handles)} collections done; abandoning the rest.")
-    finally:
-        # Drop everything still queued/running; don't wait for it.
-        ex.shutdown(wait=False, cancel_futures=True)
+
+    def run_batch(batch, workers, budget):
+        """Fetch a batch of collection handles concurrently.
+        Returns (failed_handles, timed_out)."""
+        nonlocal products
+        failed_local = []
+        timed_out = False
+        ex = ThreadPoolExecutor(max_workers=workers)
+        futs = {ex.submit(fetch_collection, store, h): h for h in batch}
+        seen = 0
+        try:
+            for fut in as_completed(futs, timeout=budget):
+                h = futs[fut]
+                try:
+                    for pid, p in fut.result().items():
+                        products[pid] = p
+                except Exception as e:
+                    failed_local.append(h)
+                    if len(failed_local) <= 5:
+                        print(f"  [{store}] collection {h!r} failed: {e}")
+                seen += 1
+                if seen % 50 == 0:
+                    print(f"  [{store}] {seen}/{len(batch)} collections, "
+                          f"{len(products)} products")
+        except TimeoutError:
+            timed_out = True
+            print(f"  [{store}] SAFETY: {SAFETY_MINUTES}m budget hit "
+                  f"({seen}/{len(batch)} done); abandoning rest.")
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+        return failed_local, timed_out
+
+    # --- Pass 1: all collections ---
+    budget = None if deadline is None else max(1.0, deadline - time.monotonic())
+    failed, timed_out = run_batch(handles, WORKERS, budget)
+    complete = not timed_out
+
+    # --- Pass 2: retry failed collections once, gently (throttle recovery) ---
+    # Throttle-dropped collections are the main undercount cause; a cooldown +
+    # lower concurrency recovers almost all of them and keeps us above the
+    # retention guard.
+    if failed and complete:
+        print(f"  [{store}] retrying {len(failed)} failed collection(s) "
+              f"after cooldown…")
+        time.sleep(10)
+        budget2 = None if deadline is None else max(1.0, deadline - time.monotonic())
+        if budget2 is None or budget2 > 30:  # only if we have time left
+            still_failed, timed_out2 = run_batch(failed, max(2, WORKERS // 2), budget2)
+            failed = still_failed
+            if timed_out2:
+                complete = False
+
     if failed:
-        print(f"  [{store}] WARNING: {failed} collection(s) errored (continued).")
+        print(f"  [{store}] WARNING: {len(failed)} collection(s) still failed "
+              f"after retry.")
     print(f"  [{store}] DONE: {len(products)} unique products"
           f"{'' if complete else ' (INCOMPLETE — time budget hit)'}")
     return products, complete
