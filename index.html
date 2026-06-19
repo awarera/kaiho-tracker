@@ -152,6 +152,12 @@ tbody tr:hover td{background:var(--s2)}
     <div class="tile"><div class="tlbl">In-Stock Value</div><div class="tval" id="k-instock-val">—</div><div class="tnote">listed retail</div></div>
     <div class="tile"><div class="tlbl">Units Sold This Week</div><div class="tval p" id="k-units-week">—</div><div class="tnote">last 7 days</div></div>
   </div>
+  <div class="g4 mb16">
+    <div class="tile"><div class="tlbl">📆 Sales This Month (value)</div><div class="tval g" id="k-sales-month">—</div><div class="tnote" id="k-sales-month-n">last 30 days</div></div>
+    <div class="tile"><div class="tlbl">Units Sold This Month</div><div class="tval p" id="k-units-month">—</div><div class="tnote">last 30 days</div></div>
+    <div class="tile"><div class="tlbl">🗓 Sales All Time (value)</div><div class="tval g" id="k-sales-all">—</div><div class="tnote" id="k-sales-all-n">since tracking began</div></div>
+    <div class="tile"><div class="tlbl">Units Sold All Time</div><div class="tval p" id="k-units-all">—</div><div class="tnote">since tracking began</div></div>
+  </div>
   <div class="g2">
     <div class="card">
       <div class="sec-title">Top Categories Sold <span class="sec-sub">this week, by units</span></div>
@@ -170,8 +176,9 @@ tbody tr:hover td{background:var(--s2)}
     <div class="fsrch"><svg width="13" height="13" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg><input type="text" id="sold-q" placeholder="Search sold items…" oninput="renderSold()"></div>
     <select class="sel" id="sold-cat" onchange="renderSold()"><option value="">All Categories</option></select>
     <select class="sel" id="sold-make" onchange="renderSold()"><option value="">All Makes</option></select>
-    <select class="sel" id="sold-range" onchange="renderSold()"><option value="">Any time</option><option value="1">Today</option><option value="7">Last 7d</option><option value="30">Last 30d</option></select>
+    <select class="sel" id="sold-range" onchange="renderSold()"><option value="">All time</option><option value="1">Today</option><option value="7">Last 7 days</option><option value="30">This month (30d)</option><option value="90">Last 90 days</option><option value="365">Last 12 months</option></select>
     <select class="sel" id="sold-sort" onchange="renderSold()"><option value="date_desc">Newest first</option><option value="date_asc">Oldest first</option><option value="price_desc">Value ↓</option><option value="price_asc">Value ↑</option></select>
+    <button class="btn bp bsm" onclick="exportSalesCSV()">↓ Export sales</button>
     <button class="btn bg bsm" onclick="resetSold()">⟳ Reset</button>
   </div>
   <div class="g4 mb12">
@@ -275,6 +282,8 @@ tbody tr:hover td{background:var(--s2)}
 var DASH=null;
 var CATALOG=null;
 var CATALOG_LOADING=false;
+var SALES=null;            // full sold-event history (sales.json), lazy-loaded
+var SALES_LOADING=false;
 var STORE='epartsworld-kenya';
 var CAT_METRIC='listings';
 var PAGE_SIZE=200;
@@ -360,12 +369,35 @@ function activeTab(){var t=document.querySelector('.tab.on');return t?t.id.repla
 function rerenderActive(){renderTab(activeTab());}
 function renderTab(name){
   if(name==='dash')        renderDash();
-  else if(name==='sold')   renderSold();
+  else if(name==='sold')   ensureSales(renderSold);
   else if(name==='catalog')ensureCatalog(renderCatalog);
   else if(name==='categories') renderCategories();
   else if(name==='new')    renderNew();
   else if(name==='prices') renderPrices();
   else if(name==='data')   ensureCatalog(renderData);
+}
+
+function ensureSales(cb){
+  if(SALES){cb();return;}
+  if(SALES_LOADING)return;
+  SALES_LOADING=true;
+  fetch('data/sales.json?_='+Date.now())
+    .then(function(r){if(!r.ok)throw new Error(r.status);return r.json();})
+    .then(function(json){
+      SALES=json;
+      SALES_LOADING=false;
+      cb();
+    })
+    .catch(function(){
+      // sales.json may not exist on a fresh baseline — treat as empty, not error.
+      SALES_LOADING=false;
+      SALES=[];
+      cb();
+    });
+}
+function salesForStore(){
+  if(!SALES)return [];
+  return STORE?SALES.filter(function(e){return e.store===STORE;}):SALES;
 }
 
 function ensureCatalog(cb){
@@ -397,10 +429,13 @@ function renderDash(){
   var wkCut=daysAgo(6);
 
   var unitsToday=0,valToday=0,unitsWeek=0,valWeek=0,newWeek=0;
+  var unitsMonth=0,valMonth=0,unitsAll=0,valAll=0;
+  var moCut=daysAgo(29);  // 30-day window
   var ebd=DASH.events_by_day||{};
   Object.keys(ebd).forEach(function(day){
     var dd=new Date(day+'T00:00:00Z');
     var inWeek=dd>=wkCut;
+    var inMonth=dd>=moCut;
     var stores=ebd[day];
     var keys=STORE?[STORE]:Object.keys(stores);
     keys.forEach(function(s){
@@ -409,6 +444,8 @@ function renderDash(){
       var nw=rec['new']||{count:0,value:0};
       if(day===today){unitsToday+=sold.count;valToday+=sold.value;}
       if(inWeek){unitsWeek+=sold.count;valWeek+=sold.value;newWeek+=nw.count;}
+      if(inMonth){unitsMonth+=sold.count;valMonth+=sold.value;}
+      unitsAll+=sold.count;valAll+=sold.value;  // all-time
     });
   });
 
@@ -425,6 +462,10 @@ function renderDash(){
   setTxt('k-units-today',hasEvents?unitsToday.toLocaleString():'—');
   setTxt('k-new-week',hasEvents?newWeek.toLocaleString():'—');
   setTxt('k-units-week',hasEvents?unitsWeek.toLocaleString():'—');
+  setTxt('k-sales-month',hasEvents?fKESshort(valMonth):'—');
+  setTxt('k-units-month',hasEvents?unitsMonth.toLocaleString():'—');
+  setTxt('k-sales-all',hasEvents?fKESshort(valAll):'—');
+  setTxt('k-units-all',hasEvents?unitsAll.toLocaleString():'—');
 
   setTxt('k-catalog',storeSum(t.catalog).toLocaleString());
   setTxt('k-catalog-n',STORE?STORE_LABEL[STORE]:(t.catalog['epartsworld-kenya'].toLocaleString()+' epw · '+t.catalog['kaihoindustry'].toLocaleString()+' kaiho'));
@@ -489,14 +530,24 @@ function applySort(rows,tab){
 }
 
 function renderSold(){
-  var rangeOverride=$('sold-range').value;
-  var rows=filterEvents('sold',{q:$('sold-q').value,cat:$('sold-cat').value,make:$('sold-make').value,range:rangeOverride});
+  if(!SALES){$('sold-tbody').innerHTML='<tr><td colspan="7"><div class="loading">Loading sales history…</div></td></tr>';return;}
+  var q=($('sold-q').value||'').toLowerCase();
+  var cat=$('sold-cat').value, make=$('sold-make').value;
+  var range=$('sold-range').value;
+  var rows=salesForStore();
+  if(cat)rows=rows.filter(function(e){return(e.category||'Other / Misc')===cat;});
+  if(make)rows=rows.filter(function(e){return(e.make||'Unknown')===make;});
+  if(range){var cut=daysAgo(parseInt(range)-1);rows=rows.filter(function(e){return new Date(e.ts+'T00:00:00Z')>=cut;});}
+  if(q)rows=rows.filter(function(e){return((e.make||'')+' '+(e.model||'')+' '+(e.title||'')+' '+(e.category||'')).toLowerCase().indexOf(q)>-1;});
+
   var srt=$('sold-sort').value;
   if(srt==='price_desc')SORT.sold={k:'price',dir:-1};
   else if(srt==='price_asc')SORT.sold={k:'price',dir:1};
   else if(srt==='date_asc')SORT.sold={k:'ts',dir:1};
   else SORT.sold={k:'ts',dir:-1};
   rows=applySort(rows,'sold');
+  window._soldRows=rows;  // for CSV export
+
   var units=rows.length;
   var value=rows.reduce(function(s,e){return s+(e.price||0);},0);
   var makes={};rows.forEach(function(e){if(e.make)makes[e.make]=1;});
@@ -513,9 +564,22 @@ function renderSold(){
       +'<td><a href="'+esc(e.url)+'" target="_blank" rel="noopener">'+esc((e.title||'').slice(0,64))+'</a></td>'
       +'<td class="mono tnum">'+fKES(e.price)+'</td></tr>';
   }).join(''):'<tr><td colspan="7"><div class="empty"><b>No sold items</b>Sold transitions appear after the first daily diff, or none match your filters.</div></td></tr>';
-  setTxt('sold-count',rows.length+' sold event'+(rows.length!==1?'s':'')+(rows.length>PAGE_SIZE?' (showing first '+PAGE_SIZE+')':''));
+  setTxt('sold-count',rows.length.toLocaleString()+' sold event'+(rows.length!==1?'s':'')+(rows.length>PAGE_SIZE?' (showing first '+PAGE_SIZE+' — export for all)':''));
 }
 function resetSold(){['sold-q','sold-cat','sold-make','sold-range','sold-sort'].forEach(function(id){var e=$(id);if(e)e.value=(id==='sold-sort'?'date_desc':'');});renderSold();}
+function exportSalesCSV(){
+  var rows=window._soldRows||salesForStore();
+  if(!rows.length){return;}
+  var cols=['ts','store','make','model','category','part_label','price','title','url'];
+  var NL='\n';
+  var csv=cols.join(',')+NL+rows.map(function(e){
+    return cols.map(function(k){var v=e[k]==null?'':e[k];return '"'+String(v).replace(/"/g,'""')+'"';}).join(',');
+  }).join(NL);
+  var blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});
+  var url=URL.createObjectURL(blob);
+  var a=document.createElement('a');a.href=url;a.download='kaiho-sales-'+rows.length+'.csv';
+  document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
+}
 
 function renderNew(){
   var rows=filterEvents('new',{q:$('new-q').value,cat:$('new-cat').value,make:$('new-make').value,range:$('new-range').value});
