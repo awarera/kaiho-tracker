@@ -652,9 +652,27 @@ def main():
         new_events = []
     else:
         new_events = diff_snapshots(prev, curr, seen, ts)
-        print(f"Events this run: {len(new_events)}")
         from collections import Counter
-        print("  by type:", dict(Counter(e["type"] for e in new_events)))
+        by_type = Counter(e["type"] for e in new_events)
+        print(f"Events this run: {len(new_events)} — by type: {dict(by_type)}")
+
+        # Sanity guard: a healthy day produces events in the dozens/hundreds.
+        # If a single day shows "sold" or "new" exceeding 25% of the whole
+        # catalog, the previous snapshot was almost certainly incompatible
+        # (e.g. a seeded placeholder, or a schema change) — diffing it produces
+        # thousands of phantom events. In that case DON'T emit events; just
+        # reseed this snapshot as a fresh baseline so tomorrow diffs cleanly.
+        catalog_total = len(curr)
+        phantom = (by_type.get("sold", 0) > 0.25 * catalog_total or
+                   by_type.get("new", 0) > 0.25 * catalog_total)
+        if phantom:
+            print(f"  ⚠ Diff produced {by_type.get('sold',0)} sold / "
+                  f"{by_type.get('new',0)} new vs {catalog_total} catalog — "
+                  f"this looks like an incompatible baseline, NOT real activity. "
+                  f"Suppressing events and reseeding as a fresh baseline.")
+            for pid, p in curr.items():
+                seen.setdefault(p["store"], {})[pid] = 1
+            new_events = []
 
     # 5. Persist. Snapshots are gzipped (diff source). The dashboard reads the
     #    compact dashboard.json below, NOT the full catalog, so we don't ship a
