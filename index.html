@@ -718,16 +718,18 @@ function renderData(){
   if(q)rows=rows.filter(function(p){return((p.title||'')+' '+(p.make||'')+' '+(p.model||'')+' '+(p.part_label||'')).toLowerCase().indexOf(q)>-1;});
   window._dataRows=rows;
   var show=rows.slice(0,PAGE_SIZE);
-  var html='<div class="tbl-wrap"><table><thead><tr><th class="nosort">Store</th><th class="nosort">Part</th><th class="nosort">Make</th><th class="nosort">Model</th><th class="nosort">Category</th><th class="nosort">Stock</th><th class="tnum nosort">Price (KES)</th><th class="nosort">Link</th></tr></thead><tbody>';
+  var html='<div class="tbl-wrap"><table><thead><tr><th class="nosort">Store</th><th class="nosort">Part</th><th class="nosort">Make</th><th class="nosort">Model</th><th class="nosort">Category</th><th class="nosort">Stock</th><th class="tnum nosort">Days Out</th><th class="tnum nosort">Price (KES)</th><th class="nosort">Link</th></tr></thead><tbody>';
   html+=show.length?show.map(function(p){
+    var daysOut=(!p.available && p.days_out!=null)?(p.days_out+'d'):'—';
     return '<tr><td>'+storeShort(p.store)+'</td>'
       +'<td>'+esc(p.part_label||'—')+'</td>'
       +'<td class="bold">'+esc(p.make||'—')+'</td><td>'+esc(p.model||'—')+'</td>'
       +'<td>'+esc(p.category||'—')+'</td>'
       +'<td>'+(p.available?'<span class="badge b-instock">In</span>':'<span class="badge b-oos">Out</span>')+'</td>'
+      +'<td class="mono tnum">'+daysOut+'</td>'
       +'<td class="mono tnum">'+fKES(p.price)+'</td>'
       +'<td><a href="'+esc(p.url)+'" target="_blank" rel="noopener">↗</a></td></tr>';
-  }).join(''):'<tr><td colspan="8"><div class="empty"><b>No listings match</b>Try clearing filters.</div></td></tr>';
+  }).join(''):'<tr><td colspan="9"><div class="empty"><b>No listings match</b>Try clearing filters.</div></td></tr>';
   html+='</tbody></table></div>';
   $('data-body').innerHTML=html;
   setTxt('dt-count',rows.length.toLocaleString()+' listing'+(rows.length!==1?'s':'')+(rows.length>PAGE_SIZE?' (showing first '+PAGE_SIZE+' — refine filters or export CSV for all)':''));
@@ -736,7 +738,7 @@ function resetData(){['dt-q','dt-cat','dt-make','dt-stock'].forEach(function(id)
 function exportCSV(){
   var rows=window._dataRows||catalogForStore();
   if(!rows.length){return;}
-  var cols=['store','part_label','make','model','category','available','price','title','url'];
+  var cols=['store','part_label','make','model','category','available','days_out','out_since','price','title','url'];
   var NL='\n';
   var csv=cols.join(',')+NL+rows.map(function(p){
     return cols.map(function(k){var v=p[k]==null?'':p[k];return '"'+String(v).replace(/"/g,'""')+'"';}).join(',');
