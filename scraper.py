@@ -57,7 +57,7 @@ WORKERS = 5                   # concurrent collection fetches per store.
                               # throttling (60s+ stalls). 5 is the balance:
                               # enough concurrency to be fast, gentle enough to
                               # avoid rate-limit walls.
-SAFETY_MINUTES = 45           # wall-clock budget. If the run ever takes this
+SAFETY_MINUTES = 30           # wall-clock budget. The tuned pull finishes in
                               # long the store is pathologically throttled, so we
                               # abort WITHOUT committing rather than risk a partial
                               # snapshot being misread as mass "sold" events.
@@ -340,16 +340,16 @@ def pull_store(store: str, deadline: float | None = None) -> tuple[dict[str, dic
     done = 0
     failed = 0
     complete = True
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futures = {ex.submit(fetch_collection, store, h): h for h in handles}
-        for fut in as_completed(futures):
-            if deadline is not None and time.monotonic() > deadline:
-                print(f"  [{store}] SAFETY: time budget exceeded mid-pull; "
-                      f"cancelling remaining collections.")
-                for f in futures:
-                    f.cancel()
-                complete = False
-                break
+    ex = ThreadPoolExecutor(max_workers=WORKERS)
+    futures = {ex.submit(fetch_collection, store, h): h for h in handles}
+    try:
+        # Enforce the wall-clock budget at the executor level: as_completed
+        # raises TimeoutError the moment the remaining budget elapses, even if
+        # several workers are mid-request. This makes a long hang impossible.
+        budget = None
+        if deadline is not None:
+            budget = max(1.0, deadline - time.monotonic())
+        for fut in as_completed(futures, timeout=budget):
             try:
                 for pid, p in fut.result().items():
                     products[pid] = p
@@ -360,6 +360,13 @@ def pull_store(store: str, deadline: float | None = None) -> tuple[dict[str, dic
             if done % 50 == 0:
                 print(f"  [{store}] {done}/{len(handles)} collections, "
                       f"{len(products)} products")
+    except TimeoutError:
+        complete = False
+        print(f"  [{store}] SAFETY: {SAFETY_MINUTES}m budget hit with "
+              f"{done}/{len(handles)} collections done; abandoning the rest.")
+    finally:
+        # Drop everything still queued/running; don't wait for it.
+        ex.shutdown(wait=False, cancel_futures=True)
     if failed:
         print(f"  [{store}] WARNING: {failed} collection(s) errored (continued).")
     print(f"  [{store}] DONE: {len(products)} unique products"
@@ -463,6 +470,10 @@ def main():
     ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
     ts_full = dt.datetime.now(dt.timezone.utc).isoformat()
     print(f"=== Catalog scrape {ts_full} ===")
+    print(f"=== scraper v2 | workers={WORKERS} timeout={REQUEST_TIMEOUT}s "
+          f"retries={MAX_RETRIES} backoff_cap={BACKOFF_CAP}s "
+          f"safety={SAFETY_MINUTES}m ===")
+    sys.stdout.flush()
 
     run_start = time.monotonic()
     deadline = run_start + SAFETY_MINUTES * 60
