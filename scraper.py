@@ -27,6 +27,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.adapters import HTTPAdapter
 
+# Force line-buffered, unbuffered stdout so every print() reaches the GitHub
+# Actions log the instant it runs — not held in a buffer that's lost if the
+# job is killed. This is why earlier runs showed an empty log: buffered output
+# never flushed before the timeout cancelled the process.
+try:
+    sys.stdout.reconfigure(line_buffering=True, write_through=True)
+    sys.stderr.reconfigure(line_buffering=True, write_through=True)
+except Exception:
+    pass
+
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
