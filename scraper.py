@@ -768,6 +768,26 @@ def build_dashboard_payload(curr: dict, events: list, store_counts: dict):
             for s, types in stores.items()
         }
 
+    # Monthly rollup (YYYY-MM -> store -> type -> {count,value}). Compact
+    # long-range time series so the dashboard can show "this month / all-time"
+    # trends without loading the full event log no matter how many months
+    # accumulate. Derived from events_by_day so it's always consistent.
+    monthly = {}
+    for d, stores in events_by_day.items():
+        ym = d[:7]  # YYYY-MM
+        mrec = monthly.setdefault(ym, {})
+        for s, types in stores.items():
+            srec = mrec.setdefault(s, {})
+            for t, v in types.items():
+                agg = srec.setdefault(t, {"count": 0, "value": 0.0})
+                agg["count"] += v["count"]
+                agg["value"] += v["value"]
+    # round values
+    for ym in monthly:
+        for s in monthly[ym]:
+            for t in monthly[ym][s]:
+                monthly[ym][s][t]["value"] = round(monthly[ym][s][t]["value"])
+
     recent = sorted(events, key=lambda e: e["ts"], reverse=True)[:1000]
 
     make_totals = sorted(make_in_stock.items(),
@@ -795,9 +815,23 @@ def build_dashboard_payload(curr: dict, events: list, store_counts: dict):
         "sold_by_category": {c: dict(v) for c, v in sold_cat.items()},
         "sold_value_by_category": {c: {s: round(val) for s, val in v.items()}
                                     for c, v in sold_cat_value.items()},
+        "monthly": monthly,
         "recent_events": recent,
     }
     save_json(DATA / "dashboard.json", payload)
+
+    # Full sales feed (sold events only, ENTIRE history, uncapped) for the Sold
+    # tab's date-range views and CSV export. Kept separate from dashboard.json
+    # so the dashboard loads instantly and only pulls the full sales log when
+    # the Sold tab needs it. Trimmed to display fields.
+    SALES_FIELDS = ("ts", "store", "make", "model", "category", "part_label",
+                    "price", "title", "url")
+    sales = [{k: e.get(k) for k in SALES_FIELDS}
+             for e in events if e.get("type") == "sold"]
+    sales.sort(key=lambda e: e["ts"], reverse=True)
+    save_json(DATA / "sales.json", sales)
+    print(f"Sales feed: {len(sales)} sold events (full history). "
+          f"Monthly rollup: {len(monthly)} month(s).")
 
     catalog = [{k: p.get(k) for k in CATALOG_FIELDS} for p in curr.values()]
     # Plain JSON, NOT gzipped: GitHub Pages auto-gzips JSON over the wire anyway,
