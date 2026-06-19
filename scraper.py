@@ -52,6 +52,7 @@ DATA = ROOT / "data"
 SNAP_DIR = DATA / "snapshots"
 EVENTS_FILE = DATA / "events.json"
 SEEN_FILE = DATA / "seen_ids.json"
+STOCK_STATE_FILE = DATA / "stock_state.json"  # Phase 2: per-product OOS timing
 LATEST_FILE = DATA / "latest.json"
 
 REQUEST_DELAY = 0.0           # no artificial delay; the pool paces itself
@@ -686,20 +687,87 @@ def main():
 
     save_json(SEEN_FILE, seen)
 
+    # Phase 2: update out-of-stock duration state (stamps days_out onto curr).
+    # Skipped on the very first run (everything would read as freshly out).
+    oos_summary = {}
+    if not first_run:
+        _, oos_summary = update_stock_state(curr, ts)
+    else:
+        # Seed the state so durations start counting from the baseline.
+        update_stock_state(curr, ts)
+
     # 6. Emit a lightweight dashboard payload (events + daily aggregates).
     #    The full snapshot is 30MB+; the dashboard only needs the velocity
     #    signal and current standing-state rollups, not every product.
-    build_dashboard_payload(curr, all_events, per_store_counts)
+    build_dashboard_payload(curr, all_events, per_store_counts, oos_summary)
 
     print(f"Snapshot: {len(snap_list)} products. Total events logged: {len(all_events)}.")
     print("=== done ===")
 
 
 CATALOG_FIELDS = ("id", "store", "title", "make", "model", "category",
-                  "part_label", "price", "available", "url")
+                  "part_label", "price", "available", "url", "days_out", "out_since")
 
 
-def build_dashboard_payload(curr: dict, events: list, store_counts: dict):
+def update_stock_state(curr: dict, ts: str) -> tuple[dict, dict]:
+    """Phase 2: track how long each product has been out of stock.
+
+    State is {id: {"out": bool, "since": "YYYY-MM-DD"|None}} persisted across
+    runs in stock_state.json. Derived purely from the daily snapshot we already
+    take — no extra requests.
+
+    Returns (new_state, oos_summary) where oos_summary is per-store:
+      {store: {"out_now": int, "buckets": {"0-7":n,"8-30":n,"31-90":n,"90+":n}}}
+    and we also stamp each currently-out product with days_out so the catalog
+    can show it.
+    """
+    state = load_json(STOCK_STATE_FILE, {})
+    today = dt.date.fromisoformat(ts)
+
+    def days_between(since):
+        try:
+            return (today - dt.date.fromisoformat(since)).days
+        except Exception:
+            return 0
+
+    new_state = {}
+    for pid, p in curr.items():
+        avail = bool(p.get("available"))
+        prev = state.get(pid)
+        if avail:
+            new_state[pid] = {"out": False, "since": None}
+        else:
+            # Out of stock now. Preserve the original out-date if we had one.
+            if prev and prev.get("out") and prev.get("since"):
+                since = prev["since"]
+            else:
+                since = ts  # first time we've seen it out
+            new_state[pid] = {"out": True, "since": since}
+            # Stamp duration onto the live product so catalog/raw can show it.
+            p["days_out"] = days_between(since)
+            p["out_since"] = since
+
+    # Build a per-store summary of out-of-stock durations.
+    from collections import defaultdict
+    summary = defaultdict(lambda: {"out_now": 0,
+                                    "buckets": {"0-7": 0, "8-30": 0,
+                                                "31-90": 0, "90+": 0}})
+    for pid, p in curr.items():
+        st = new_state.get(pid)
+        if st and st["out"]:
+            s = p["store"]
+            d = days_between(st["since"])
+            summary[s]["out_now"] += 1
+            b = ("0-7" if d <= 7 else "8-30" if d <= 30
+                 else "31-90" if d <= 90 else "90+")
+            summary[s]["buckets"][b] += 1
+
+    save_json(STOCK_STATE_FILE, new_state)
+    return new_state, {s: dict(v) for s, v in summary.items()}
+
+
+def build_dashboard_payload(curr: dict, events: list, store_counts: dict,
+                            oos_summary: dict = None):
     """Write two files:
       - data/dashboard.json : compact aggregates (loads instantly; every tab's
         summary numbers + the full recent-event log).
@@ -816,6 +884,7 @@ def build_dashboard_payload(curr: dict, events: list, store_counts: dict):
         "sold_value_by_category": {c: {s: round(val) for s, val in v.items()}
                                     for c, v in sold_cat_value.items()},
         "monthly": monthly,
+        "oos": oos_summary or {},
         "recent_events": recent,
     }
     save_json(DATA / "dashboard.json", payload)
