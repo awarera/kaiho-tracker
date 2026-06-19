@@ -20,6 +20,7 @@ import re
 import sys
 import time
 import gzip
+import threading
 import datetime as dt
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -54,24 +55,27 @@ SEEN_FILE = DATA / "seen_ids.json"
 LATEST_FILE = DATA / "latest.json"
 
 REQUEST_DELAY = 0.0           # no artificial delay; the pool paces itself
-MAX_RETRIES = 3               # per-request retry budget (was 6 — too many on
-                              # a throttled store, each retry burns the timeout)
-BACKOFF_BASE = 1.6            # gentler exponential backoff
-BACKOFF_CAP = 6.0            # max sleep between retries (was 30 — a single
-                              # throttled request could otherwise stall ~minutes)
-REQUEST_TIMEOUT = 12          # per-request hard timeout (was 30 — throttled
-                              # requests hung to the wall and doubled on retry)
+MAX_RETRIES = 5               # per-request retry budget. With proper pacing
+                              # (see RATE_LIMIT) 429s are rare, so we can afford
+                              # more retries to ride out any that slip through.
+BACKOFF_BASE = 2.0            # exponential backoff base
+BACKOFF_CAP = 20.0           # max sleep between retries. Bigger than before:
+                              # a 429 means "slow down", so wait meaningfully.
+REQUEST_TIMEOUT = 15          # per-request hard timeout
 PER_PAGE = 250                # Shopify hard max
-WORKERS = 5                   # concurrent collection fetches per store.
-                              # 8 was too aggressive — it triggered MORE store
-                              # throttling (60s+ stalls). 5 is the balance:
-                              # enough concurrency to be fast, gentle enough to
-                              # avoid rate-limit walls.
-SAFETY_MINUTES = 30           # wall-clock budget. The tuned pull finishes in
-                              # long the store is pathologically throttled, so we
-                              # abort WITHOUT committing rather than risk a partial
-                              # snapshot being misread as mass "sold" events.
-                              # Sits under the 60-min job timeout for a clean exit.
+WORKERS = 3                   # concurrent collection fetches per store.
+                              # The store 429-walls bursts: 5 workers caused
+                              # >250/436 collections to fail. 3 workers + the
+                              # global rate limiter below keeps us under the wall.
+RATE_LIMIT = 4.0              # max requests/second GLOBALLY across all workers.
+                              # This is the real fix: a shared limiter paces all
+                              # threads so requests go out steadily instead of in
+                              # bursts that trigger 429s. ~4 req/s is sustainable
+                              # against these Shopify storefronts.
+SAFETY_MINUTES = 40           # wall-clock budget. Steady pacing is a bit slower
+                              # per request but far more reliable; allow more time.
+                              # If exceeded we abort WITHOUT committing rather than
+                              # risk a partial snapshot. Under the 60-min job cap.
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; catalog-monitor/1.0)",
     "Accept": "application/json",
@@ -233,6 +237,29 @@ SESSION.mount("https://", _adapter)
 SESSION.mount("http://", _adapter)
 
 
+class RateLimiter:
+    """Thread-safe global rate limiter. All worker threads call acquire()
+    before every request, so the COMBINED request rate across the whole pool
+    never exceeds `rate` req/s. This is what actually prevents 429 storms —
+    bursts, not total volume, are what the store walls on."""
+    def __init__(self, rate_per_sec: float):
+        self.min_interval = 1.0 / rate_per_sec
+        self.lock = threading.Lock()
+        self.next_time = 0.0
+
+    def acquire(self):
+        with self.lock:
+            now = time.monotonic()
+            wait = self.next_time - now
+            if wait > 0:
+                time.sleep(wait)
+                now = time.monotonic()
+            self.next_time = max(now, self.next_time) + self.min_interval
+
+
+RATE = RateLimiter(RATE_LIMIT)
+
+
 class FetchError(Exception):
     """Raised when a request fails after exhausting retries (throttle/network).
     Distinct from a 404, which legitimately means 'nothing here'. This lets the
@@ -246,6 +273,7 @@ def get_json(url: str):
     last_status = None
     for attempt in range(MAX_RETRIES):
         try:
+            RATE.acquire()   # global pacing — prevents 429-causing bursts
             r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
             if r.status_code == 200:
                 if REQUEST_DELAY:
@@ -254,8 +282,16 @@ def get_json(url: str):
             if r.status_code == 404:
                 return None  # genuinely nothing here
             last_status = r.status_code
-            # 429/503/502/500 and anything else: back off and retry.
-            time.sleep(min(BACKOFF_CAP, BACKOFF_BASE ** attempt))
+            # 429/503/etc: respect Retry-After if given, else exponential backoff.
+            retry_after = r.headers.get("Retry-After")
+            if retry_after:
+                try:
+                    sleep = min(BACKOFF_CAP, float(retry_after))
+                except ValueError:
+                    sleep = min(BACKOFF_CAP, BACKOFF_BASE ** attempt)
+            else:
+                sleep = min(BACKOFF_CAP, BACKOFF_BASE ** attempt)
+            time.sleep(sleep)
         except requests.RequestException as e:
             last_status = repr(e)
             time.sleep(min(BACKOFF_CAP, BACKOFF_BASE ** attempt))
