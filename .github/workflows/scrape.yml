@@ -16,6 +16,8 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    # Parallel scraper finishes in a few minutes; this high ceiling is just a
+    # safety net so a slow day with heavy retries is never killed mid-run.
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -30,7 +32,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run scraper
-        run: python scraper.py
+        run: python -u scraper.py
+        env:
+          PYTHONUNBUFFERED: "1"
 
       - name: Commit data
         run: |
