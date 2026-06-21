@@ -53,6 +53,11 @@ SNAP_DIR = DATA / "snapshots"
 EVENTS_FILE = DATA / "events.json"
 SEEN_FILE = DATA / "seen_ids.json"
 STOCK_STATE_FILE = DATA / "stock_state.json"  # Phase 2: per-product OOS timing
+PENDING_FILE = DATA / "pending_sales.json"  # candidate sales awaiting confirmation
+CONFIRM_DAYS = 2  # an availability-flip must persist this many days (unavailable,
+                  # not discounted) before it counts as a sale. 48h window: kills
+                  # on-sale/temporarily-destocked false positives. Disappeared
+                  # products bypass this and confirm instantly.
 LATEST_FILE = DATA / "latest.json"
 
 REQUEST_DELAY = 0.0           # no artificial delay; the pool paces itself
@@ -507,10 +512,45 @@ def latest_snapshot_path() -> Path | None:
     return snaps[-1] if snaps else None
 
 
-def diff_snapshots(prev: dict, curr: dict, seen: dict, ts: str) -> list[dict]:
+def _on_sale(prod: dict) -> bool:
+    """True if the product is carrying a discount (compare_at strictly above the
+    live price). On these stores an item put 'on sale' often flips available->
+    false while it's re-staged, WITHOUT being sold. That is the dominant cause
+    of false-positive sales, so a flip accompanied by a sale price is NOT a sale.
+    """
+    price = prod.get("price")
+    cmp_at = prod.get("compare_at")
+    try:
+        return (cmp_at is not None and price is not None
+                and float(cmp_at) > float(price))
+    except (TypeError, ValueError):
+        return False
+
+
+def diff_snapshots(prev: dict, curr: dict, seen: dict, ts: str,
+                   pending: dict | None = None) -> list[dict]:
     """Emit events from prev->curr. prev/curr are {id: product}. seen is
-    {store: {id: 1}} of every id ever observed (cold-start guard)."""
+    {store: {id: 1}} of every id ever observed (cold-start guard).
+
+    Sale detection (revised — was generating false positives):
+      * available true->false WITH a sale price       -> price_change ("on sale"),
+                                                          NOT a sale.
+      * available true->false WITHOUT a sale price     -> PENDING sale. Recorded in
+                                                          `pending` ledger, emitted as
+                                                          a confirmed 'sold' only after
+                                                          it stays unavailable + un-
+                                                          discounted across the
+                                                          confirmation window
+                                                          (resolve_pending_sales()).
+      * product DISAPPEARS from every collection       -> instant confirmed 'sold'
+                                                          (highest confidence).
+
+    `pending` is the {id: {...}} ledger persisted in stock_state-adjacent storage;
+    we mutate it in place. Confirmed-sold events for disappeared items are returned
+    immediately; deferred ones are emitted later by resolve_pending_sales().
+    """
     events = []
+    pending = pending if pending is not None else {}
     prev_ids = set(prev)
     curr_ids = set(curr)
 
@@ -522,17 +562,46 @@ def diff_snapshots(prev: dict, curr: dict, seen: dict, ts: str) -> list[dict]:
 
         if pid in prev:
             p = prev[pid]
-            # Sale proxy: available true -> false
-            if p.get("available") and not c.get("available"):
-                events.append(_evt("sold", c, ts))
-            # Restock: false -> true
-            elif (not p.get("available")) and c.get("available"):
+            flipped_out = p.get("available") and not c.get("available")
+            flipped_in = (not p.get("available")) and c.get("available")
+
+            if flipped_out:
+                if _on_sale(c):
+                    # Discounted + unavailable = staged for a sale price, not sold.
+                    e = _evt("price_change", c, ts)
+                    e["old_price"] = p.get("price")
+                    e["new_price"] = c.get("price")
+                    e["on_sale"] = True
+                    events.append(e)
+                    emitted_price_change = True
+                else:
+                    # Clean disappearance of availability — candidate sale. Hold it.
+                    pending[pid] = {
+                        "since": ts,
+                        "snap": _evt("sold", c, ts),  # frozen event payload
+                    }
+                    emitted_price_change = False
+            elif flipped_in:
                 events.append(_evt("restocked", c, ts))
-            # Price change
-            if p.get("price") is not None and c.get("price") is not None and p["price"] != c["price"]:
+                pending.pop(pid, None)  # came back -> not a sale
+                emitted_price_change = False
+            else:
+                # Still available, or still unavailable: if it's back in stock,
+                # any stale pending entry must be cleared.
+                if c.get("available"):
+                    pending.pop(pid, None)
+                emitted_price_change = False
+
+            # Price change (independent of availability) — unless the flip-out
+            # branch already emitted an on-sale price_change for this product.
+            if (not emitted_price_change
+                    and p.get("price") is not None and c.get("price") is not None
+                    and p["price"] != c["price"]):
                 e = _evt("price_change", c, ts)
                 e["old_price"] = p["price"]
                 e["new_price"] = c["price"]
+                if _on_sale(c):
+                    e["on_sale"] = True
                 events.append(e)
         else:
             # Not in previous snapshot. Only "new" if never seen before AND in stock.
@@ -540,11 +609,15 @@ def diff_snapshots(prev: dict, curr: dict, seen: dict, ts: str) -> list[dict]:
                 events.append(_evt("new", c, ts))
         seen_store[pid] = 1
 
-    # Disappeared products = sold (only if previously in stock).
+    # Disappeared products = instant confirmed sale (only if previously in stock).
+    # Highest-confidence signal: gone from every collection.
     for pid in prev_ids - curr_ids:
         p = prev[pid]
         if p.get("available"):
-            events.append(_evt("sold", p, ts, disappeared=True))
+            ev = _evt("sold", p, ts, disappeared=True)
+            ev["confidence"] = "confirmed"
+            events.append(ev)
+        pending.pop(pid, None)
 
     return events
 
@@ -566,6 +639,50 @@ def _evt(kind, prod, ts, disappeared=False):
     if disappeared:
         e["disappeared"] = True
     return e
+
+
+def resolve_pending_sales(pending: dict, curr: dict, ts: str) -> tuple[list, dict]:
+    """Promote pending availability-flips to confirmed sales once they survive
+    the confirmation window. A pending candidate becomes a confirmed 'sold' when:
+      * it has been pending for >= CONFIRM_DAYS, AND
+      * it is still in the catalog but unavailable, AND
+      * it is NOT currently carrying a sale price.
+    A candidate is DROPPED (no sale) if it restocked, went on sale, or vanished
+    (the disappeared-branch in diff_snapshots already emitted that as a sale).
+
+    Returns (confirmed_sold_events, surviving_pending). Items still inside the
+    window but not yet resolved are kept in `pending` for the next run.
+    """
+    today = dt.date.fromisoformat(ts)
+    confirmed = []
+    survivors = {}
+
+    def age(since):
+        try:
+            return (today - dt.date.fromisoformat(since)).days
+        except Exception:
+            return 0
+
+    for pid, rec in pending.items():
+        c = curr.get(pid)
+        if c is None:
+            # Disappeared entirely between runs — the diff's disappeared branch
+            # handles it as a confirmed sale. Drop the pending (no double count).
+            continue
+        if c.get("available"):
+            continue  # restocked -> not a sale
+        if _on_sale(c):
+            continue  # went on sale -> price change, not a sale
+        if age(rec["since"]) >= CONFIRM_DAYS:
+            ev = dict(rec["snap"])
+            ev["ts"] = ts                # date the sale is CONFIRMED
+            ev["detected"] = rec["since"]  # date availability first dropped
+            ev["confidence"] = "likely"
+            confirmed.append(ev)
+        else:
+            survivors[pid] = rec  # still within window — keep waiting
+
+    return confirmed, survivors
 
 
 # ----------------------------------------------------------------------------
@@ -645,17 +762,30 @@ def main():
     seen = load_json(SEEN_FILE, {})
     first_run = not prev and not seen
 
+    # Load the pending-sales ledger (candidate flips awaiting confirmation).
+    pending = load_json(PENDING_FILE, {})
+
     # 4. Diff -> events.
     if first_run:
         print("First run: seeding seen_ids, emitting ZERO sold events.")
         for pid, p in curr.items():
             seen.setdefault(p["store"], {})[pid] = 1
         new_events = []
+        pending = {}
     else:
-        new_events = diff_snapshots(prev, curr, seen, ts)
+        new_events = diff_snapshots(prev, curr, seen, ts, pending)
+
+        # Resolve any pending candidates that have cleared the confirmation window.
+        confirmed_sold, pending = resolve_pending_sales(pending, curr, ts)
+        if confirmed_sold:
+            print(f"Confirmed {len(confirmed_sold)} pending sale(s) past the "
+                  f"{CONFIRM_DAYS}-day window.")
+        new_events.extend(confirmed_sold)
+
         from collections import Counter
         by_type = Counter(e["type"] for e in new_events)
-        print(f"Events this run: {len(new_events)} — by type: {dict(by_type)}")
+        print(f"Events this run: {len(new_events)} — by type: {dict(by_type)} "
+              f"| pending now: {len(pending)}")
 
         # Sanity guard: a healthy day produces events in the dozens/hundreds.
         # If a single day shows "sold" or "new" exceeding 25% of the whole
@@ -674,6 +804,7 @@ def main():
             for pid, p in curr.items():
                 seen.setdefault(p["store"], {})[pid] = 1
             new_events = []
+            pending = {}
 
     # 5. Persist. Snapshots are gzipped (diff source). The dashboard reads the
     #    compact dashboard.json below, NOT the full catalog, so we don't ship a
@@ -686,6 +817,7 @@ def main():
     save_json(EVENTS_FILE, all_events)
 
     save_json(SEEN_FILE, seen)
+    save_json(PENDING_FILE, pending)
 
     # Phase 2: update out-of-stock duration state (stamps days_out onto curr).
     # Skipped on the very first run (everything would read as freshly out).
@@ -699,7 +831,7 @@ def main():
     # 6. Emit a lightweight dashboard payload (events + daily aggregates).
     #    The full snapshot is 30MB+; the dashboard only needs the velocity
     #    signal and current standing-state rollups, not every product.
-    build_dashboard_payload(curr, all_events, per_store_counts, oos_summary)
+    build_dashboard_payload(curr, all_events, per_store_counts, oos_summary, pending)
 
     print(f"Snapshot: {len(snap_list)} products. Total events logged: {len(all_events)}.")
     print("=== done ===")
@@ -767,7 +899,7 @@ def update_stock_state(curr: dict, ts: str) -> tuple[dict, dict]:
 
 
 def build_dashboard_payload(curr: dict, events: list, store_counts: dict,
-                            oos_summary: dict = None):
+                            oos_summary: dict = None, pending: dict = None):
     """Write two files:
       - data/dashboard.json : compact aggregates (loads instantly; every tab's
         summary numbers + the full recent-event log).
@@ -887,6 +1019,17 @@ def build_dashboard_payload(curr: dict, events: list, store_counts: dict,
         "oos": oos_summary or {},
         "recent_events": recent,
     }
+    # Pending-sale candidates awaiting confirmation (for the status line).
+    if pending is not None:
+        from collections import Counter as _C
+        pbs = _C()
+        for rec in pending.values():
+            snap = rec.get("snap") or {}
+            st = snap.get("store")
+            if st:
+                pbs[st] += 1
+        payload["pending_count"] = len(pending)
+        payload["pending_by_store"] = dict(pbs)
     save_json(DATA / "dashboard.json", payload)
 
     # Full sales feed (sold events only, ENTIRE history, uncapped) for the Sold
@@ -894,7 +1037,7 @@ def build_dashboard_payload(curr: dict, events: list, store_counts: dict,
     # so the dashboard loads instantly and only pulls the full sales log when
     # the Sold tab needs it. Trimmed to display fields.
     SALES_FIELDS = ("ts", "store", "make", "model", "category", "part_label",
-                    "price", "title", "url")
+                    "price", "title", "url", "confidence", "detected", "disappeared")
     sales = [{k: e.get(k) for k in SALES_FIELDS}
              for e in events if e.get("type") == "sold"]
     sales.sort(key=lambda e: e["ts"], reverse=True)

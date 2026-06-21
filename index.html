@@ -94,6 +94,19 @@ tbody tr:hover td{background:var(--s2)}
 .loading{padding:50px;text-align:center;color:var(--ink3);font-size:13px}
 .notice{background:var(--abg);border:1px solid var(--abd);border-radius:var(--rs);padding:10px 13px;font-size:12px;color:var(--am);margin-bottom:14px;line-height:1.5}
 .countline{font-size:12px;color:var(--ink3);margin-top:10px}
+.statusline{background:var(--s2);border:1px solid var(--bd);border-radius:var(--rs);padding:11px 14px;font-size:12.5px;color:var(--ink2);line-height:1.55;margin-bottom:16px}
+.statusline b{color:var(--ink);font-weight:700}
+.sl-warn{color:var(--am);font-weight:600}
+.tile.hero{padding:16px 17px}
+.tile.hero .tval{font-size:25px}
+.standing{display:flex;flex-wrap:wrap;gap:7px 22px;padding:11px 15px;background:var(--wh);border:1px solid var(--bd);border-radius:var(--r);box-shadow:var(--sh);margin-bottom:16px;font-size:12px;color:var(--ink3)}
+.standing b{font-family:'DM Mono',monospace;color:var(--ink);font-weight:500;font-size:13.5px}
+.badge.bc{background:var(--gbg);color:var(--g);border:1px solid var(--gbd)}
+.badge.bl{background:var(--abg);color:var(--am);border:1px solid var(--abd)}
+.subdate{font-size:10px;color:var(--ink4);margin-top:2px}
+@media(max-width:640px){
+  .standing{gap:6px 16px;font-size:11px}
+}
 @media(max-width:640px){
   .g4{grid-template-columns:1fr 1fr}
   .g3{grid-template-columns:1fr}
@@ -140,23 +153,19 @@ tbody tr:hover td{background:var(--s2)}
 <!-- DASHBOARD -->
 <div class="tab on" id="tab-dash">
   <div id="dash-notice"></div>
+  <div class="statusline" id="statusline">Loading…</div>
   <div class="g4 mb16">
-    <div class="tile"><div class="tlbl">⏱ Sales Today (value)</div><div class="tval g" id="k-sales-today">—</div><div class="tnote" id="k-sales-today-n">listed value of items sold</div></div>
-    <div class="tile"><div class="tlbl">📅 Sales This Week (value)</div><div class="tval g" id="k-sales-week">—</div><div class="tnote">last 7 days</div></div>
-    <div class="tile"><div class="tlbl">📦 Units Sold Today</div><div class="tval p" id="k-units-today">—</div><div class="tnote">in-stock → out transitions</div></div>
-    <div class="tile"><div class="tlbl">🆕 New Listings (7d)</div><div class="tval a" id="k-new-week">—</div><div class="tnote">their intake rate</div></div>
+    <div class="tile hero"><div class="tlbl">✅ Confirmed Sales <span id="hero-range-lbl">(7d)</span></div><div class="tval g" id="k-sales-week">—</div><div class="tnote" id="k-units-week">— units</div></div>
+    <div class="tile hero"><div class="tlbl">📦 Live Listings</div><div class="tval b" id="k-instock">—</div><div class="tnote" id="k-instock-n"></div></div>
+    <div class="tile hero"><div class="tlbl">🆕 New Listings (7d)</div><div class="tval a" id="k-new-week">—</div><div class="tnote">their intake rate</div></div>
+    <div class="tile hero"><div class="tlbl">💰 In-Stock Value</div><div class="tval" id="k-instock-val">—</div><div class="tnote">listed retail</div></div>
   </div>
-  <div class="g4 mb16">
-    <div class="tile"><div class="tlbl">Catalog Tracked</div><div class="tval b" id="k-catalog">—</div><div class="tnote" id="k-catalog-n"></div></div>
-    <div class="tile"><div class="tlbl">In Stock Now</div><div class="tval" id="k-instock">—</div><div class="tnote" id="k-instock-n"></div></div>
-    <div class="tile"><div class="tlbl">In-Stock Value</div><div class="tval" id="k-instock-val">—</div><div class="tnote">listed retail</div></div>
-    <div class="tile"><div class="tlbl">Units Sold This Week</div><div class="tval p" id="k-units-week">—</div><div class="tnote">last 7 days</div></div>
-  </div>
-  <div class="g4 mb16">
-    <div class="tile"><div class="tlbl">📆 Sales This Month (value)</div><div class="tval g" id="k-sales-month">—</div><div class="tnote" id="k-sales-month-n">last 30 days</div></div>
-    <div class="tile"><div class="tlbl">Units Sold This Month</div><div class="tval p" id="k-units-month">—</div><div class="tnote">last 30 days</div></div>
-    <div class="tile"><div class="tlbl">🗓 Sales All Time (value)</div><div class="tval g" id="k-sales-all">—</div><div class="tnote" id="k-sales-all-n">since tracking began</div></div>
-    <div class="tile"><div class="tlbl">Units Sold All Time</div><div class="tval p" id="k-units-all">—</div><div class="tnote">since tracking began</div></div>
+  <div class="standing" id="standing">
+    <span><b id="s-catalog">—</b> tracked</span>
+    <span><b id="s-sales-today">—</b> sold today</span>
+    <span><b id="s-sales-month">—</b> this month</span>
+    <span><b id="s-sales-all">—</b> all-time confirmed</span>
+    <span><b id="s-pending">—</b> awaiting confirmation</span>
   </div>
   <div class="g2">
     <div class="card">
@@ -164,7 +173,7 @@ tbody tr:hover td{background:var(--s2)}
       <div id="dash-cat-sold"></div>
     </div>
     <div class="card">
-      <div class="sec-title">Recent Sold <span class="sec-sub">latest transitions</span></div>
+      <div class="sec-title">Recent Sold <span class="sec-sub">latest confirmed</span></div>
       <div id="dash-recent-sold"></div>
     </div>
   </div>
@@ -188,7 +197,7 @@ tbody tr:hover td{background:var(--s2)}
     <div class="tile"><div class="tlbl">Distinct Makes</div><div class="tval b" id="sold-k-makes">—</div></div>
   </div>
   <div class="tbl-wrap"><table>
-    <thead><tr><th data-k="ts">Date</th><th data-k="store">Store</th><th data-k="make">Make</th><th data-k="model">Model</th><th data-k="category">Category</th><th class="nosort">Listing</th><th data-k="price" class="tnum">Value (KES)</th></tr></thead>
+    <thead><tr><th data-k="ts" title="Date the sale was confirmed (after the 48h verification window)">Confirmed</th><th class="nosort" title="Confirmed = item disappeared from the catalog (highest confidence). Likely = item went unavailable and stayed unavailable, un-discounted, across the window.">Confidence</th><th data-k="store">Store</th><th data-k="make">Make</th><th data-k="model">Model</th><th data-k="category">Category</th><th class="nosort">Listing</th><th data-k="price" class="tnum">Value (KES)</th></tr></thead>
     <tbody id="sold-tbody"></tbody>
   </table></div>
   <div class="countline" id="sold-count"></div>
@@ -450,29 +459,32 @@ function renderDash(){
   });
 
   var hasEvents=(DASH.recent_events||[]).length>0;
-  if(!hasEvents){
-    $('dash-notice').innerHTML='<div class="notice"><b>Awaiting first diff.</b> '
-      +'Sales appear once the scraper has two daily snapshots to compare. '
-      +'The catalog, categories and raw-data tabs work now from the baseline.</div>';
-  }else{ $('dash-notice').innerHTML=''; }
+  var anySold=unitsAll>0;
+  $('dash-notice').innerHTML='';
 
-  setTxt('k-sales-today',hasEvents?fKESshort(valToday):'—');
-  setTxt('k-sales-today-n',hasEvents?(unitsToday+' units'):'awaiting first diff');
-  setTxt('k-sales-week',hasEvents?fKESshort(valWeek):'—');
-  setTxt('k-units-today',hasEvents?unitsToday.toLocaleString():'—');
-  setTxt('k-new-week',hasEvents?newWeek.toLocaleString():'—');
-  setTxt('k-units-week',hasEvents?unitsWeek.toLocaleString():'—');
-  setTxt('k-sales-month',hasEvents?fKESshort(valMonth):'—');
-  setTxt('k-units-month',hasEvents?unitsMonth.toLocaleString():'—');
-  setTxt('k-sales-all',hasEvents?fKESshort(valAll):'—');
-  setTxt('k-units-all',hasEvents?unitsAll.toLocaleString():'—');
+  // Plain-English status line — sets honest expectations for a cold reader.
+  var nStores=STORE?1:Object.keys(DASH.totals.catalog).length;
+  var pending=(DASH.pending_count!=null)?(STORE?(DASH.pending_by_store&&DASH.pending_by_store[STORE]||0):DASH.pending_count):0;
+  var sl='Tracking <b>'+storeSum(t.catalog).toLocaleString()+'</b> listings across <b>'+nStores+'</b> competitor store'+(nStores!==1?'s':'')
+    +'. A sale is confirmed after a <b>48-hour</b> verification window (an item must stay unavailable and un-discounted), so figures build up daily.';
+  if(!anySold){ sl+=' <span class="sl-warn">No sales confirmed yet — '+pending.toLocaleString()+' candidate'+(pending!==1?'s':'')+' currently in the window.</span>'; }
+  $('statusline').innerHTML=sl;
 
-  setTxt('k-catalog',storeSum(t.catalog).toLocaleString());
-  setTxt('k-catalog-n',STORE?STORE_LABEL[STORE]:(t.catalog['epartsworld-kenya'].toLocaleString()+' epw · '+t.catalog['kaihoindustry'].toLocaleString()+' kaiho'));
+  // Hero tiles (week-focused).
+  setTxt('k-sales-week',anySold?fKESshort(valWeek):'KES 0');
+  setTxt('k-units-week',unitsWeek.toLocaleString()+' units · 7d');
+  setTxt('k-new-week',newWeek.toLocaleString());
   setTxt('k-instock',storeSum(t.in_stock).toLocaleString());
   var ic=storeSum(t.in_stock),cc=storeSum(t.catalog);
-  setTxt('k-instock-n',cc?Math.round(100*ic/cc)+'% of catalog':'');
+  setTxt('k-instock-n',cc?Math.round(100*ic/cc)+'% of '+cc.toLocaleString()+' tracked':'');
   setTxt('k-instock-val',fKESshort(storeSum(t.in_stock_value)));
+
+  // Standing strip (secondary numbers, de-emphasised).
+  setTxt('s-catalog',storeSum(t.catalog).toLocaleString());
+  setTxt('s-sales-today',unitsToday.toLocaleString());
+  setTxt('s-sales-month',unitsMonth.toLocaleString());
+  setTxt('s-sales-all',unitsAll.toLocaleString());
+  setTxt('s-pending',pending.toLocaleString());
 
   var catSold={};
   eventsForStore().forEach(function(e){
@@ -530,7 +542,7 @@ function applySort(rows,tab){
 }
 
 function renderSold(){
-  if(!SALES){$('sold-tbody').innerHTML='<tr><td colspan="7"><div class="loading">Loading sales history…</div></td></tr>';return;}
+  if(!SALES){$('sold-tbody').innerHTML='<tr><td colspan="8"><div class="loading">Loading sales history…</div></td></tr>';return;}
   var q=($('sold-q').value||'').toLowerCase();
   var cat=$('sold-cat').value, make=$('sold-make').value;
   var range=$('sold-range').value;
@@ -558,19 +570,24 @@ function renderSold(){
   var tb=$('sold-tbody');
   var show=rows.slice(0,PAGE_SIZE);
   tb.innerHTML=show.length?show.map(function(e){
-    return '<tr><td class="mono tnum">'+esc(e.ts)+'</td><td>'+storeShort(e.store)+'</td>'
+    var conf=e.confidence||'likely';
+    var badge=(conf==='confirmed')
+      ? '<span class="badge bc" title="Disappeared from the catalog entirely">● Confirmed</span>'
+      : '<span class="badge bl" title="Went unavailable and stayed unavailable, un-discounted, across the window">● Likely</span>';
+    var det=e.detected&&e.detected!==e.ts?'<div class="subdate">flipped '+esc(e.detected)+'</div>':'';
+    return '<tr><td class="mono tnum">'+esc(e.ts)+det+'</td><td>'+badge+'</td><td>'+storeShort(e.store)+'</td>'
       +'<td class="bold">'+esc(e.make||'—')+'</td><td>'+esc(e.model||'—')+'</td>'
       +'<td>'+esc(e.category||'—')+'</td>'
       +'<td><a href="'+esc(e.url)+'" target="_blank" rel="noopener">'+esc((e.title||'').slice(0,64))+'</a></td>'
       +'<td class="mono tnum">'+fKES(e.price)+'</td></tr>';
-  }).join(''):'<tr><td colspan="7"><div class="empty"><b>No sold items</b>Sold transitions appear after the first daily diff, or none match your filters.</div></td></tr>';
-  setTxt('sold-count',rows.length.toLocaleString()+' sold event'+(rows.length!==1?'s':'')+(rows.length>PAGE_SIZE?' (showing first '+PAGE_SIZE+' — export for all)':''));
+  }).join(''):'<tr><td colspan="8"><div class="empty"><b>No confirmed sales yet</b>Sales confirm after the 48-hour window, or none match your filters.</div></td></tr>';
+  setTxt('sold-count',rows.length.toLocaleString()+' confirmed sale'+(rows.length!==1?'s':'')+(rows.length>PAGE_SIZE?' (showing first '+PAGE_SIZE+' — export for all)':''));
 }
 function resetSold(){['sold-q','sold-cat','sold-make','sold-range','sold-sort'].forEach(function(id){var e=$(id);if(e)e.value=(id==='sold-sort'?'date_desc':'');});renderSold();}
 function exportSalesCSV(){
   var rows=window._soldRows||salesForStore();
   if(!rows.length){return;}
-  var cols=['ts','store','make','model','category','part_label','price','title','url'];
+  var cols=['ts','confidence','detected','store','make','model','category','part_label','price','title','url'];
   var NL='\n';
   var csv=cols.join(',')+NL+rows.map(function(e){
     return cols.map(function(k){var v=e[k]==null?'':e[k];return '"'+String(v).replace(/"/g,'""')+'"';}).join(',');
