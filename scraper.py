@@ -527,6 +527,43 @@ def _on_sale(prod: dict) -> bool:
         return False
 
 
+_CHASSIS_RE = re.compile(r"#(\d{6,})")
+
+
+def _chassis(prod_or_title) -> str | None:
+    """Extract the vehicle chassis/ref number (e.g. #0002002661808) from a title.
+    This is the STABLE identity of the donor vehicle — it survives the seller
+    re-listing a car's individual parts as a single '[CHOOSE PARTS]' parent.
+    Accepts a product dict or a raw title string.
+    """
+    title = prod_or_title.get("title") if isinstance(prod_or_title, dict) else prod_or_title
+    if not title:
+        return None
+    m = _CHASSIS_RE.search(title)
+    return m.group(1) if m else None
+
+
+def _is_choose_parts(prod: dict) -> bool:
+    """A '[CHOOSE PARTS]' listing is a consolidated per-car parent that this
+    seller creates when rolling up a donor vehicle's individual part listings.
+    Its appearance is a re-listing event, NOT hundreds of sales."""
+    t = (prod.get("title") or "").upper()
+    return t.startswith("[CHOOSE PARTS]")
+
+
+def _build_chassis_index(curr: dict) -> dict:
+    """Map chassis-number -> set of current product ids that carry it. Used to
+    decide whether a disappeared item was actually sold or merely re-listed:
+    if its chassis still exists somewhere in the live catalog, it was
+    consolidated/re-listed (its donor car is still being parted out), not sold."""
+    idx = {}
+    for pid, p in curr.items():
+        ch = _chassis(p)
+        if ch:
+            idx.setdefault(ch, set()).add(pid)
+    return idx
+
+
 def diff_snapshots(prev: dict, curr: dict, seen: dict, ts: str,
                    pending: dict | None = None) -> list[dict]:
     """Emit events from prev->curr. prev/curr are {id: product}. seen is
@@ -553,6 +590,9 @@ def diff_snapshots(prev: dict, curr: dict, seen: dict, ts: str,
     pending = pending if pending is not None else {}
     prev_ids = set(prev)
     curr_ids = set(curr)
+    # Index of chassis numbers still present in the live catalog. A disappeared
+    # item whose chassis still exists was re-listed/consolidated, not sold.
+    curr_chassis = _build_chassis_index(curr)
 
     for pid in curr_ids:
         c = curr[pid]
@@ -609,15 +649,31 @@ def diff_snapshots(prev: dict, curr: dict, seen: dict, ts: str,
                 events.append(_evt("new", c, ts))
         seen_store[pid] = 1
 
-    # Disappeared products = instant confirmed sale (only if previously in stock).
-    # Highest-confidence signal: gone from every collection.
+    # Disappeared products: a sale ONLY if the donor vehicle is truly gone.
+    # This seller re-lists a car's individual parts as one '[CHOOSE PARTS]'
+    # parent — the part-handles vanish but the car (same chassis #) is still
+    # being sold. So a disappearance is a real sale only when NO product in the
+    # current catalog shares its chassis number. Items with no chassis at all
+    # fall back to the old disappearance=sale rule (rare; ~0.2%).
+    consolidated = 0
     for pid in prev_ids - curr_ids:
         p = prev[pid]
-        if p.get("available"):
-            ev = _evt("sold", p, ts, disappeared=True)
-            ev["confidence"] = "confirmed"
-            events.append(ev)
+        if not p.get("available"):
+            pending.pop(pid, None)
+            continue
+        ch = _chassis(p)
+        if ch and ch in curr_chassis:
+            # Donor car still in catalog under a new/consolidated listing -> NOT sold.
+            consolidated += 1
+            pending.pop(pid, None)
+            continue
+        ev = _evt("sold", p, ts, disappeared=True)
+        ev["confidence"] = "confirmed"
+        events.append(ev)
         pending.pop(pid, None)
+    if consolidated:
+        print(f"  Suppressed {consolidated} disappeared item(s) whose chassis is "
+              f"still in catalog (re-listed/consolidated, not sold).")
 
     return events
 
@@ -656,6 +712,7 @@ def resolve_pending_sales(pending: dict, curr: dict, ts: str) -> tuple[list, dic
     today = dt.date.fromisoformat(ts)
     confirmed = []
     survivors = {}
+    curr_chassis = _build_chassis_index(curr)
 
     def age(since):
         try:
@@ -667,12 +724,19 @@ def resolve_pending_sales(pending: dict, curr: dict, ts: str) -> tuple[list, dic
         c = curr.get(pid)
         if c is None:
             # Disappeared entirely between runs — the diff's disappeared branch
-            # handles it as a confirmed sale. Drop the pending (no double count).
+            # handles it (with its own chassis guard). Drop the pending here.
             continue
         if c.get("available"):
             continue  # restocked -> not a sale
         if _on_sale(c):
             continue  # went on sale -> price change, not a sale
+        if _is_choose_parts(c):
+            continue  # became a consolidated parent -> re-listing, not a sale
+        # If another live product shares this item's chassis, the donor car is
+        # still being parted out under a re-listed/consolidated handle -> not sold.
+        ch = _chassis(rec.get("snap") or c)
+        if ch and ch in curr_chassis and curr_chassis[ch] - {pid}:
+            continue
         if age(rec["since"]) >= CONFIRM_DAYS:
             ev = dict(rec["snap"])
             ev["ts"] = ts                # date the sale is CONFIRMED
