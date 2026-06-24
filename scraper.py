@@ -58,6 +58,12 @@ CONFIRM_DAYS = 2  # an availability-flip must persist this many days (unavailabl
                   # not discounted) before it counts as a sale. 48h window: kills
                   # on-sale/temporarily-destocked false positives. Disappeared
                   # products bypass this and confirm instantly.
+FLIP_HISTORY_FILE = DATA / "flip_history.json"  # per-store rolling daily flip counts
+BULK_MULTIPLIER = 5.0   # a day's flips are "bulk" (re-staging / consolidation, NOT
+                        # sales) if they exceed BULK_MULTIPLIER x the trailing average.
+BULK_MIN_FLOOR = 300    # ...and exceed this absolute floor (so a quiet store whose
+                        # average is ~5 doesn't flag 30 normal sales as "bulk").
+FLIP_HISTORY_LEN = 14   # days of history kept for the trailing average.
 LATEST_FILE = DATA / "latest.json"
 
 REQUEST_DELAY = 0.0           # no artificial delay; the pool paces itself
@@ -565,34 +571,31 @@ def _build_chassis_index(curr: dict) -> dict:
 
 
 def diff_snapshots(prev: dict, curr: dict, seen: dict, ts: str,
-                   pending: dict | None = None) -> list[dict]:
+                   pending: dict | None = None) -> tuple[list[dict], dict]:
     """Emit events from prev->curr. prev/curr are {id: product}. seen is
     {store: {id: 1}} of every id ever observed (cold-start guard).
 
-    Sale detection (revised — was generating false positives):
-      * available true->false WITH a sale price       -> price_change ("on sale"),
-                                                          NOT a sale.
-      * available true->false WITHOUT a sale price     -> PENDING sale. Recorded in
-                                                          `pending` ledger, emitted as
-                                                          a confirmed 'sold' only after
-                                                          it stays unavailable + un-
-                                                          discounted across the
-                                                          confirmation window
-                                                          (resolve_pending_sales()).
-      * product DISAPPEARS from every collection       -> instant confirmed 'sold'
-                                                          (highest confidence).
+    Sale detection:
+      * available true->false WITH a sale price  -> price_change ("on sale"), NOT a sale.
+      * available true->false WITHOUT a sale price -> PENDING sale candidate. Held in
+        the `pending` ledger; confirmed only after it stays unavailable + un-discounted
+        across the 48h window (resolve_pending_sales()). Audit of 5 days of snapshots
+        showed ~89% of clean flips that survive 48h are genuine sales.
+      * product DISAPPEARS entirely -> instant confirmed 'sold'.
 
-    `pending` is the {id: {...}} ledger persisted in stock_state-adjacent storage;
-    we mutate it in place. Confirmed-sold events for disappeared items are returned
-    immediately; deferred ones are emitted later by resolve_pending_sales().
+    Returns (events, flips_by_store) where flips_by_store maps store -> [pid, ...] of
+    the clean availability-flips created as pending THIS run. main() compares that count
+    to the store's trailing average; abnormally large batches (the competitor bulk
+    re-staging / consolidating listings) are diverted to 'bulk_activity' instead of
+    being counted as sales.
+
+    `pending` is mutated in place.
     """
     events = []
     pending = pending if pending is not None else {}
     prev_ids = set(prev)
     curr_ids = set(curr)
-    # Index of chassis numbers still present in the live catalog. A disappeared
-    # item whose chassis still exists was re-listed/consolidated, not sold.
-    curr_chassis = _build_chassis_index(curr)
+    flips_by_store = {}  # store -> [pid,...] clean flips created as pending this run
 
     for pid in curr_ids:
         c = curr[pid]
@@ -620,6 +623,7 @@ def diff_snapshots(prev: dict, curr: dict, seen: dict, ts: str,
                         "since": ts,
                         "snap": _evt("sold", c, ts),  # frozen event payload
                     }
+                    flips_by_store.setdefault(store, []).append(pid)
                     emitted_price_change = False
             elif flipped_in:
                 events.append(_evt("restocked", c, ts))
@@ -650,32 +654,24 @@ def diff_snapshots(prev: dict, curr: dict, seen: dict, ts: str,
         seen_store[pid] = 1
 
     # Disappeared products: a sale ONLY if the donor vehicle is truly gone.
-    # This seller re-lists a car's individual parts as one '[CHOOSE PARTS]'
-    # parent — the part-handles vanish but the car (same chassis #) is still
-    # being sold. So a disappearance is a real sale only when NO product in the
-    # current catalog shares its chassis number. Items with no chassis at all
-    # fall back to the old disappearance=sale rule (rare; ~0.2%).
-    consolidated = 0
+    # Disappeared products (gone from every collection) that were in stock: these
+    # are sale candidates too. We treat them the same as clean availability-flips —
+    # added to `pending` and counted toward the per-store flip tally so the bulk
+    # circuit-breaker in main() can divert abnormal batches (mass consolidation /
+    # re-staging) while keeping normal-volume disappearances as sales. (Earlier a
+    # chassis guard suppressed ALL of these; an audit showed that also discarded
+    # genuine trickle sales from cars still being parted out, so it's removed.)
     for pid in prev_ids - curr_ids:
         p = prev[pid]
         if not p.get("available"):
             pending.pop(pid, None)
             continue
-        ch = _chassis(p)
-        if ch and ch in curr_chassis:
-            # Donor car still in catalog under a new/consolidated listing -> NOT sold.
-            consolidated += 1
-            pending.pop(pid, None)
-            continue
-        ev = _evt("sold", p, ts, disappeared=True)
-        ev["confidence"] = "confirmed"
-        events.append(ev)
-        pending.pop(pid, None)
-    if consolidated:
-        print(f"  Suppressed {consolidated} disappeared item(s) whose chassis is "
-              f"still in catalog (re-listed/consolidated, not sold).")
+        store = p["store"]
+        snap = _evt("sold", p, ts, disappeared=True)
+        pending[pid] = {"since": ts, "snap": snap, "disappeared": True}
+        flips_by_store.setdefault(store, []).append(pid)
 
-    return events
+    return events, flips_by_store
 
 
 def _evt(kind, prod, ts, disappeared=False):
@@ -701,18 +697,18 @@ def resolve_pending_sales(pending: dict, curr: dict, ts: str) -> tuple[list, dic
     """Promote pending availability-flips to confirmed sales once they survive
     the confirmation window. A pending candidate becomes a confirmed 'sold' when:
       * it has been pending for >= CONFIRM_DAYS, AND
-      * it is still in the catalog but unavailable, AND
+      * it has stayed unavailable (or gone) the whole time, AND
       * it is NOT currently carrying a sale price.
-    A candidate is DROPPED (no sale) if it restocked, went on sale, or vanished
-    (the disappeared-branch in diff_snapshots already emitted that as a sale).
+    A candidate is DROPPED (no sale) if it restocked or went on sale within the window.
+    Items flagged on a BULK day (see main()) never reach here — they're diverted to
+    'bulk_activity' before being added to the confirmable pending ledger.
 
     Returns (confirmed_sold_events, surviving_pending). Items still inside the
-    window but not yet resolved are kept in `pending` for the next run.
+    window are kept in `pending` for the next run.
     """
     today = dt.date.fromisoformat(ts)
     confirmed = []
     survivors = {}
-    curr_chassis = _build_chassis_index(curr)
 
     def age(since):
         try:
@@ -722,31 +718,80 @@ def resolve_pending_sales(pending: dict, curr: dict, ts: str) -> tuple[list, dic
 
     for pid, rec in pending.items():
         c = curr.get(pid)
-        if c is None:
-            # Disappeared entirely between runs — the diff's disappeared branch
-            # handles it (with its own chassis guard). Drop the pending here.
+        disappeared = rec.get("disappeared")
+        if c is None and not disappeared:
+            # Vanished but wasn't flagged as a disappearance candidate — ambiguous;
+            # drop it rather than guess.
             continue
-        if c.get("available"):
-            continue  # restocked -> not a sale
-        if _on_sale(c):
-            continue  # went on sale -> price change, not a sale
-        if _is_choose_parts(c):
-            continue  # became a consolidated parent -> re-listing, not a sale
-        # If another live product shares this item's chassis, the donor car is
-        # still being parted out under a re-listed/consolidated handle -> not sold.
-        ch = _chassis(rec.get("snap") or c)
-        if ch and ch in curr_chassis and curr_chassis[ch] - {pid}:
-            continue
+        if c is not None:
+            if c.get("available"):
+                continue  # restocked -> not a sale
+            if _on_sale(c):
+                continue  # went on sale -> price change, not a sale
+        # c is None & disappeared -> still gone -> good, count it.
         if age(rec["since"]) >= CONFIRM_DAYS:
             ev = dict(rec["snap"])
-            ev["ts"] = ts                # date the sale is CONFIRMED
+            ev["ts"] = ts                  # date the sale is CONFIRMED
             ev["detected"] = rec["since"]  # date availability first dropped
-            ev["confidence"] = "likely"
+            ev["confidence"] = "confirmed" if disappeared else "likely"
             confirmed.append(ev)
         else:
             survivors[pid] = rec  # still within window — keep waiting
 
     return confirmed, survivors
+
+
+def apply_bulk_circuit_breaker(flips_by_store, pending, flip_history, ts):
+    """Adaptive guard against the competitor's bulk re-staging / consolidation days.
+
+    For each store, compare this run's clean-flip count to the trailing average of
+    prior runs. If it exceeds BULK_MULTIPLIER x average AND the BULK_MIN_FLOOR, the
+    batch is treated as bulk catalog activity, NOT sales: those pending candidates
+    are removed from the confirmable ledger and returned as 'bulk_activity' events
+    (so the dashboard can show the event happened without polluting the sale count).
+
+    Normal-volume days pass straight through — their flips stay in `pending` and
+    confirm as sales after the 48h window.
+
+    Mutates `pending` (removes diverted pids) and `flip_history` (appends today's
+    counts). Returns a list of 'bulk_activity' summary events (one per bulked store).
+    """
+    bulk_events = []
+    for store, pids in flips_by_store.items():
+        hist = flip_history.get(store, [])
+        n = len(pids)
+        avg = (sum(hist) / len(hist)) if hist else 0.0
+        is_bulk = hist and n > BULK_MULTIPLIER * max(avg, 1) and n > BULK_MIN_FLOOR
+        if is_bulk:
+            # Divert: remove these from pending so they can't confirm as sales.
+            diverted_value = 0.0
+            for pid in pids:
+                rec = pending.pop(pid, None)
+                if rec:
+                    diverted_value += (rec.get("snap", {}).get("price") or 0)
+            bulk_events.append({
+                "type": "bulk_activity",
+                "ts": ts,
+                "store": store,
+                "count": n,
+                "value": round(diverted_value, 2),
+                "trailing_avg": round(avg, 1),
+                "note": "Competitor bulk re-staging/consolidation — excluded from sales.",
+            })
+            print(f"  BULK day for {store}: {n} flips vs trailing avg {avg:.0f} "
+                  f"(>{BULK_MULTIPLIER}x) — diverted to bulk_activity, NOT counted as sales.")
+        else:
+            if hist:
+                print(f"  {store}: {n} flips (trailing avg {avg:.0f}) — normal, "
+                      f"feeding sale pipeline.")
+            else:
+                print(f"  {store}: {n} flips (no history yet) — feeding sale pipeline.")
+        # Update history with NORMAL days only — a bulk batch must not inflate the
+        # baseline it's measured against (otherwise the next batch looks 'normal').
+        if not is_bulk:
+            hist.append(n)
+            flip_history[store] = hist[-FLIP_HISTORY_LEN:]
+    return bulk_events
 
 
 # ----------------------------------------------------------------------------
@@ -830,6 +875,7 @@ def main():
     pending = load_json(PENDING_FILE, {})
 
     # 4. Diff -> events.
+    flip_history = load_json(FLIP_HISTORY_FILE, {})
     if first_run:
         print("First run: seeding seen_ids, emitting ZERO sold events.")
         for pid, p in curr.items():
@@ -837,7 +883,14 @@ def main():
         new_events = []
         pending = {}
     else:
-        new_events = diff_snapshots(prev, curr, seen, ts, pending)
+        new_events, flips_by_store = diff_snapshots(prev, curr, seen, ts, pending)
+
+        # Adaptive bulk circuit-breaker: divert abnormal flip batches (the
+        # competitor's bulk re-staging / consolidation) away from the sale
+        # pipeline BEFORE they can confirm. Normal-volume flips pass through.
+        bulk_events = apply_bulk_circuit_breaker(flips_by_store, pending,
+                                                 flip_history, ts)
+        new_events.extend(bulk_events)
 
         # Resolve any pending candidates that have cleared the confirmation window.
         confirmed_sold, pending = resolve_pending_sales(pending, curr, ts)
@@ -882,6 +935,7 @@ def main():
 
     save_json(SEEN_FILE, seen)
     save_json(PENDING_FILE, pending)
+    save_json(FLIP_HISTORY_FILE, flip_history)
 
     # Phase 2: update out-of-stock duration state (stamps days_out onto curr).
     # Skipped on the very first run (everything would read as freshly out).
@@ -1017,6 +1071,11 @@ def build_dashboard_payload(curr: dict, events: list, store_counts: dict,
         t = e["type"]
         price = e.get("price") or 0
         rec = by_day[d][s][t]
+        if t == "bulk_activity":
+            # A bulk_activity event summarises a whole batch; use its own count/value.
+            rec["count"] += e.get("count") or 0
+            rec["value"] += e.get("value") or 0
+            continue
         rec["count"] += 1
         rec["value"] += price
         if t == "sold":
@@ -1052,7 +1111,12 @@ def build_dashboard_payload(curr: dict, events: list, store_counts: dict,
             for t in monthly[ym][s]:
                 monthly[ym][s][t]["value"] = round(monthly[ym][s][t]["value"])
 
-    recent = sorted(events, key=lambda e: e["ts"], reverse=True)[:1000]
+    # Cap recent events at 1000, but PRIORITISE sold/bulk_activity so a flood of
+    # 'new' listings can't crowd them out (the dashboard cards read this list).
+    _priority = {"sold": 0, "bulk_activity": 1, "restocked": 2, "price_change": 3, "new": 4}
+    recent = sorted(events, key=lambda e: e["ts"], reverse=True)
+    recent = sorted(recent, key=lambda e: _priority.get(e["type"], 9))[:1000]
+    recent = sorted(recent, key=lambda e: e["ts"], reverse=True)
 
     make_totals = sorted(make_in_stock.items(),
                          key=lambda kv: -sum(kv[1].values()))[:30]

@@ -101,6 +101,8 @@ tbody tr:hover td{background:var(--s2)}
 .tile.hero .tval{font-size:25px}
 .standing{display:flex;flex-wrap:wrap;gap:7px 22px;padding:11px 15px;background:var(--wh);border:1px solid var(--bd);border-radius:var(--r);box-shadow:var(--sh);margin-bottom:16px;font-size:12px;color:var(--ink3)}
 .standing b{font-family:'DM Mono',monospace;color:var(--ink);font-weight:500;font-size:13.5px}
+.bulk-stat{color:var(--am)!important}
+.bulk-stat b{color:var(--am)!important}
 .badge.bc{background:var(--gbg);color:var(--g);border:1px solid var(--gbd)}
 .badge.bl{background:var(--abg);color:var(--am);border:1px solid var(--abd)}
 .subdate{font-size:10px;color:var(--ink4);margin-top:2px}
@@ -155,17 +157,18 @@ tbody tr:hover td{background:var(--s2)}
   <div id="dash-notice"></div>
   <div class="statusline" id="statusline">Loading…</div>
   <div class="g4 mb16">
-    <div class="tile hero"><div class="tlbl">✅ Confirmed Sales <span id="hero-range-lbl">(7d)</span></div><div class="tval g" id="k-sales-week">—</div><div class="tnote" id="k-units-week">— units</div></div>
+    <div class="tile hero"><div class="tlbl">✅ Parts Moved <span id="hero-range-lbl">(7d)</span></div><div class="tval g" id="k-sales-week">—</div><div class="tnote" id="k-units-week">— parts · went unavailable 48h+</div></div>
     <div class="tile hero"><div class="tlbl">📦 Live Listings</div><div class="tval b" id="k-instock">—</div><div class="tnote" id="k-instock-n"></div></div>
     <div class="tile hero"><div class="tlbl">🆕 New Listings (7d)</div><div class="tval a" id="k-new-week">—</div><div class="tnote">their intake rate</div></div>
     <div class="tile hero"><div class="tlbl">💰 In-Stock Value</div><div class="tval" id="k-instock-val">—</div><div class="tnote">listed retail</div></div>
   </div>
   <div class="standing" id="standing">
     <span><b id="s-catalog">—</b> tracked</span>
-    <span><b id="s-sales-today">—</b> sold today</span>
+    <span><b id="s-sales-today">—</b> moved today</span>
     <span><b id="s-sales-month">—</b> this month</span>
-    <span><b id="s-sales-all">—</b> all-time confirmed</span>
+    <span><b id="s-sales-all">—</b> all-time</span>
     <span><b id="s-pending">—</b> awaiting confirmation</span>
+    <span class="bulk-stat" id="bulk-strip" style="display:none">🔄 <b id="s-bulk">—</b> bulk re-staged (7d, excluded)</span>
   </div>
   <div class="g2">
     <div class="card">
@@ -458,21 +461,40 @@ function renderDash(){
     });
   });
 
+  // Bulk catalog activity (competitor re-staging/consolidation) — counted
+  // separately from sales. Read from events_by_day (reliable; not capped).
+  var bulkWeek=0, bulkValWeek=0, bulkAll=0;
+  Object.keys(ebd).forEach(function(day){
+    var dd=new Date(day+'T00:00:00Z');
+    var stores=ebd[day];
+    var keys=STORE?[STORE]:Object.keys(stores);
+    keys.forEach(function(s){
+      var rec=stores[s];if(!rec||!rec.bulk_activity)return;
+      var b=rec.bulk_activity;
+      bulkAll+=b.count||0;
+      if(dd>=wkCut){bulkWeek+=b.count||0; bulkValWeek+=b.value||0;}
+    });
+  });
+
   var hasEvents=(DASH.recent_events||[]).length>0;
   var anySold=unitsAll>0;
   $('dash-notice').innerHTML='';
 
-  // Plain-English status line — sets honest expectations for a cold reader.
+  // Plain-English status line — honest about what the numbers mean.
   var nStores=STORE?1:Object.keys(DASH.totals.catalog).length;
   var pending=(DASH.pending_count!=null)?(STORE?(DASH.pending_by_store&&DASH.pending_by_store[STORE]||0):DASH.pending_count):0;
   var sl='Tracking <b>'+storeSum(t.catalog).toLocaleString()+'</b> listings across <b>'+nStores+'</b> competitor store'+(nStores!==1?'s':'')
-    +'. A sale is confirmed after a <b>48-hour</b> verification window (an item must stay unavailable and un-discounted), so figures build up daily.';
-  if(!anySold){ sl+=' <span class="sl-warn">No sales confirmed yet — '+pending.toLocaleString()+' candidate'+(pending!==1?'s':'')+' currently in the window.</span>'; }
+    +'. "Parts moved" = listings that went unavailable and stayed unavailable for <b>48h+</b> (a sale proxy).';
+  if(bulkWeek>0){
+    sl+=' <span class="sl-warn">The competitor is bulk re-staging listings (~'+bulkWeek.toLocaleString()+' this week); those are tracked separately and excluded from parts-moved.</span>';
+  } else if(!anySold){
+    sl+=' <span class="sl-warn">Nothing confirmed yet — '+pending.toLocaleString()+' candidate'+(pending!==1?'s':'')+' in the 48h window.</span>';
+  }
   $('statusline').innerHTML=sl;
 
   // Hero tiles (week-focused).
-  setTxt('k-sales-week',anySold?fKESshort(valWeek):'KES 0');
-  setTxt('k-units-week',unitsWeek.toLocaleString()+' units · 7d');
+  setTxt('k-sales-week',fKESshort(valWeek));
+  setTxt('k-units-week',unitsWeek.toLocaleString()+' parts · unavailable 48h+');
   setTxt('k-new-week',newWeek.toLocaleString());
   setTxt('k-instock',storeSum(t.in_stock).toLocaleString());
   var ic=storeSum(t.in_stock),cc=storeSum(t.catalog);
@@ -485,6 +507,12 @@ function renderDash(){
   setTxt('s-sales-month',unitsMonth.toLocaleString());
   setTxt('s-sales-all',unitsAll.toLocaleString());
   setTxt('s-pending',pending.toLocaleString());
+  if(bulkAll>0){
+    $('bulk-strip').style.display='';
+    setTxt('s-bulk',bulkWeek.toLocaleString());
+  }else{
+    $('bulk-strip').style.display='none';
+  }
 
   var catSold={};
   eventsForStore().forEach(function(e){
